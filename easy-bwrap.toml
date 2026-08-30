@@ -102,7 +102,7 @@ x11     = true
 shm     = true
 seccomp = "browser"
 
-# ---------- 应用预设 ----------
+# ---------- 应用预设示例 ----------
 [preset.opencode]
 program = "/usr/bin/opencode"
 alias   = "oc"
@@ -118,13 +118,6 @@ bind = [
   "~/.cache/uv:rw-try",
 ]
 
-[preset.codewhale]
-program = "/usr/bin/codewhale"
-alias   = "cw"
-pwd = true
-seccomp = "browser"
-bind = ["~/.codewhale:create"]
-
 [preset.splayer]
 program = "/opt/SPlayer-Next/SPlayer-Next"
 dbus = "proxy"
@@ -138,15 +131,8 @@ bind = [
   "/tmp:rw",
 ]
 
-[preset.phira]
-program = "/mnt/Exten/Software/Phira/phira-main"
-dbus = "proxy"
-wayland  = true
-pipewire = true
-bind = ["/mnt/Exten/Software/Phira"]
-
 [preset.antigravity]
-program = "/home/6EACzz/.local/opt/antigravity-cli/antigravity"
+program = "~/.local/opt/antigravity-cli/antigravity"
 alias   = "agr"
 dbus = "proxy"
 pwd = true
@@ -156,11 +142,11 @@ bind = [
 ]
 
 [preset.deepseek-harness]
-program = "/home/6EACzz/.local/opt/deepseek-harness/entry.sh"
+program = "~/.local/opt/deepseek-harness/entry.sh"
 alias   = "dsh"
 dbus = "proxy"
 seccomp = "harness"
-setenv = { DSH_DIR = "/home/6EACzz/.local/opt/deepseek-harness" }
+setenv = { DSH_DIR = "~/.local/opt/deepseek-harness" }
 bind = [
   "~/.local/opt/deepseek-harness/home:~",  # vitrul home
   "~/.local/opt/deepseek-harness",         # dsh
@@ -168,7 +154,6 @@ bind = [
   "~/.local/share/pnpm:rw-try",            # pnpm cache
   "~/.npmrc:ro-try",                       # npm config
   "~/.cache/uv:rw-try",                    # uv
-  "/home/6EACzz/Dev:rw-try",
 ]
 
 # ============================================================
@@ -244,4 +229,3 @@ deny bpf perf_event_open userfaultfd syslog
 deny ptrace process_vm_readv process_vm_writev
 deny keyctl add_key request_key
 """
-

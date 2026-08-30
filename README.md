@@ -1,6 +1,7 @@
 # EasyBwrap
 
 个人自用项目，在ArchLinux调试，不做通用承诺，也不保证非Arch环境可用。
+README下方剩余内容为LLM生成，大概不准确；但是暂时懒得调了。有空再写，也可能不写。
 
 EasyBwrap 是一个用 Python 写的沙盒启动脚本（`easy-bwrap.py`），用来以配置文件的方式使用 [bubblewrap](https://github.com/containers/bubblewrap)（bwrap）。预设化配置与指定运行程序；支持高级安全特性配置；支持通过此工具运行的程序的状态管理。
 
