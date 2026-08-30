@@ -1,0 +1,247 @@
+# ============================================================
+# run-sandbox.toml — run-sandbox 配置文件
+#
+# 风格约定:
+#   * 布尔一律使用 TOML 的 true / false
+#   * dbus 是唯一的三态枚举: "off" | "proxy" | "direct"
+#   * bind 首选紧凑字符串写法 "src[:dst][:mode]";
+#     只有路径本身含冒号时才需要表写法
+#   * 未列出的特性/绑定/程序一律不生效
+#     (唯一例外: seccomp 特性默认 true, 可在 [features] 或预设中关闭)
+#
+# 配置优先级 (低 -> 高):
+#   [features] / [general] 全局默认
+#   < extends 引用的预设
+#   < 当前预设自身配置
+#   < 命令行 --override
+#
+# 状态目录: [general] state_dir (仅此一个路径, 建议放在 /tmp)
+#   每个运行任务占用一个 <预设名>.<随机串>/ 子目录:
+#     info.json  运行记录 (run-sandbox ps/stop/kill 使用)
+#     dbus/      dbus=proxy 时的代理 socket (可选)
+#     vhome/     vhome=true 时创建的虚拟家目录 (可选)
+#   程序退出或被 stop/kill 后, 该子目录会被主动清理。
+# ============================================================
+
+[general]
+default = "zsh"     # 新 zsh = 旧 zsh-sec（精简安全）；如需旧默认行为改成 "zsh-full"
+editor = "nvim"
+security = true
+state_dir = "/tmp/run-sandbox-state"   # 状态根目录：每任务 <preset>.<随机串>/ 子目录
+# 安全黑名单: "路径" 树匹配(含子树); "路径:exact" 仅精确; ~ = $HOME
+blocklist = ["/", "/etc", "/usr", "/opt", "/sys", "/dev", "/run", "/proc", "~:exact", "~/.ssh"]
+# 其他常用敏感路径参考: "~/.gnupg" "~/.aws" "~/.config" "~/.local" "~/.cache"
+#                      "~/.password-store" "~/.netrc" "~/.git-credentials"
+dbus = "off"        # off: 不开放 | proxy: 过滤代理 | direct: 直接绑定宿主总线
+dbus_whitelist = ["org.freedesktop.portal.*", "org.fcitx.Fcitx5"]
+
+# ---------- 特性全局默认 (各预设可覆盖) ----------
+[features]
+base     = true   # /usr /etc /sys /opt 只读挂载 + /bin /sbin /lib /lib64 + /proc /dev
+gpu.nv   = true   # NVIDIA 设备直通
+gpu.dri  = true   # /dev/dri 直通
+tmpfs    = true   # /tmp /run 使用内存文件系统
+shm      = false  # /dev/shm 使用内存文件系统
+pwd      = false  # 绑定当前工作目录 (需要访问项目的预设再打开)
+net      = true   # false 时 --unshare-net
+vtty     = false  # true 时 --new-session (独立终端会话; 免疫 TIOCSTI, 但部分 TUI 可能显示异常)
+wayland  = false  # Wayland 会话共享
+pipewire = false  # Pipewire 音频通道
+x11      = false  # X11 + xwayland 包装 (display 号 200..999 动态分配)
+vhome    = false  # 虚拟化 $HOME (在状态目录新建目录并 rw 绑定到 $HOME)
+seccomp  = true   # 系统调用过滤 (默认开启; 按预设或 --override 可关闭)
+
+# ============================================================
+# 预设: [preset.<名称>]
+#   program = "绝对路径"   程序入口 (继承 extends 时可省略)
+#   alias   = "缩写"       入口别名, 写在 program 下一行
+#                          (可作程序名或 --as 的配置来源; 不被 extends 继承, 可省略)
+#   extends = "预设名"      引用某一已有预设作为基础配置
+#   特性 = true|false       覆盖该预设的特性
+#   dbus / dbus_whitelist  覆盖全局默认
+#   setenv = { K = "V" }   环境变量 (与 extends 按键合并)
+#   bind   = [...]         绑定列表 (自身给出时整体替换 extends 的 bind)
+#   seccomp = true|false|"配置名"   系统调用过滤: true 用 default, 字符串选 [seccomp] 其他档
+#
+# bind 推荐写法:
+#   "src"              等价 "src:src:rw" (默认 rw, 缺失由 bwrap 报错)
+#   "src:ro"           只读            "src:create"  先 mkdir -p 再绑定
+#   "src:rw-try"       缺失跳过        "src:ro-try"  只读且缺失跳过
+#   "src:dst"          绑定到不同路径 (rw)
+#   "src:dst:mode"     不同路径 + 模式
+# 路径含冒号时用表写法: { src = "a:b", dst = "c:d", mode = "ro" }
+# ============================================================
+
+[preset.zsh]
+program = "/usr/bin/zsh"
+dbus    = "off"
+gpu.nv  = false
+gpu.dri = false
+wayland = false
+pipewire = false
+x11     = false
+shm     = false
+pwd     = true
+vhome   = true
+setenv = { BWRAP_SANDBOX = "1" }
+bind = [
+  "~/.zshrc:ro",
+  "~/.config/fontconfig:ro-try",
+  "~/.config/gtk-3.0:ro-try",
+]
+
+[preset.zsh-full]
+extends = "zsh"
+# program 继承自 zsh
+dbus    = "proxy"
+gpu.nv  = true
+gpu.dri = true
+wayland = true
+pipewire = true
+x11     = true
+shm     = true
+seccomp = "browser"
+
+# ---------- 应用预设 ----------
+[preset.opencode]
+program = "/usr/bin/opencode"
+alias   = "oc"
+pwd = true
+seccomp = "browser"
+bind = [
+  "~/.config/opencode:create",
+  "~/.local/share/opencode:create",
+  "~/.local/state/opencode",
+  "~/.cache/opencode",
+  "~/.bun",
+  "~/.cc-switch:ro",
+  "~/.cache/uv:rw-try",
+]
+
+[preset.codewhale]
+program = "/usr/bin/codewhale"
+alias   = "cw"
+pwd = true
+seccomp = "browser"
+bind = ["~/.codewhale:create"]
+
+[preset.splayer]
+program = "/opt/SPlayer-Next/SPlayer-Next"
+dbus = "proxy"
+wayland  = true
+pipewire = true
+tmpfs    = false
+seccomp = "browser"
+bind = [
+  "/mnt/Exten/Cache/Splayer-Next:rw",
+  "~/.config/SPlayer-Next:rw",
+  "/tmp:rw",
+]
+
+[preset.phira]
+program = "/mnt/Exten/Software/Phira/phira-main"
+dbus = "proxy"
+wayland  = true
+pipewire = true
+bind = ["/mnt/Exten/Software/Phira"]
+
+[preset.antigravity]
+program = "/home/6EACzz/.local/opt/antigravity-cli/antigravity"
+alias   = "agr"
+dbus = "proxy"
+pwd = true
+bind = [
+  "~/.local/opt/antigravity-cli/home:~:rw",
+  "~/.local/opt/antigravity-cli/antigravity:ro",
+]
+
+[preset.deepseek-harness]
+program = "/home/6EACzz/.local/opt/deepseek-harness/entry.sh"
+alias   = "dsh"
+dbus = "proxy"
+seccomp = "harness"
+setenv = { DSH_DIR = "/home/6EACzz/.local/opt/deepseek-harness" }
+bind = [
+  "~/.local/opt/deepseek-harness/home:~",  # vitrul home
+  "~/.local/opt/deepseek-harness",         # dsh
+  "~/.local/share/pnpm/store:rw-try",      # pnpm store
+  "~/.local/share/pnpm:rw-try",            # pnpm cache
+  "~/.npmrc:ro-try",                       # npm config
+  "~/.cache/uv:rw-try",                    # uv
+  "/home/6EACzz/Dev:rw-try",
+]
+
+# ============================================================
+# [seccomp] 系统调用过滤配置集
+#
+#   default = """..."""    seccomp=true 时使用的默认配置 (必填)
+#   其他任意键 = """..."""  自定义配置, 例如 filterA
+#
+# 预设/--override 选择方式:
+#   seccomp = true          使用 default
+#   seccomp = false         关闭
+#   seccomp = "filterA"     使用自定义配置
+#
+# 运行时会据此生成 C 源码、即时编译, 导出 BPF 后通过
+# --add-seccomp-fd 传给 bwrap (参考 flatpak common/flatpak-run.c)。
+# 首次编译后缓存到 <state_dir>/.seccomp-cache/,
+# 文件名为 seccomp-<blake2b(文本)>.{c,gen,bpf};
+# 文本变化时哈希不同, 自动重新生成; 缓存不自动清理。
+#
+# 行语法 (每行一个动作, 系统调用可列多个):
+#   default allow|deny|errno <CODE>|kill|log   # 默认动作, 至多一次
+#   allow  <syscall...>                        # 放行
+#   deny   <syscall...>                        # 返回 EPERM
+#   errno <CODE> <syscall...>                  # 返回指定 errno
+#   kill   <syscall...>                        # 直接杀死进程
+#   log    <syscall...>                        # 记录日志后按默认动作
+#   tiocsti                                    # 拦截 ioctl(TIOCSTI) 终端注入
+# ============================================================
+[seccomp]
+default = """
+# 默认放行, 只禁用高危/逃逸类调用
+default allow
+# 终端注入
+tiocsti
+# 挂载/根目录逃逸
+deny mount umount2 pivot_root chroot
+# 文件句柄绕过 mount 隔离
+deny open_by_handle_at name_to_handle_at
+# 禁止沙盒内再次嵌套 namespace
+deny unshare setns
+# 内核模块与重启
+deny init_module finit_module delete_module
+deny reboot swapon swapoff kexec_load kexec_file_load
+# eBPF / perf / userfaultfd / 内核日志
+deny bpf perf_event_open userfaultfd syslog
+# 进程注入与密钥环
+deny ptrace process_vm_readv process_vm_writev
+deny keyctl add_key request_key
+"""
+
+browser = """
+default allow
+tiocsti
+deny mount umount2 pivot_root
+deny setns
+deny open_by_handle_at name_to_handle_at
+deny init_module finit_module delete_module
+deny reboot swapon swapoff kexec_load kexec_file_load
+deny bpf perf_event_open userfaultfd syslog
+deny ptrace process_vm_readv process_vm_writev
+deny keyctl add_key request_key
+"""
+
+harness = """
+default allow
+tiocsti
+#deny mount umount2 pivot_root
+#deny setns
+deny open_by_handle_at name_to_handle_at
+deny init_module finit_module delete_module
+deny reboot swapon swapoff kexec_load kexec_file_load
+deny bpf perf_event_open userfaultfd syslog
+deny ptrace process_vm_readv process_vm_writev
+deny keyctl add_key request_key
+"""
+
