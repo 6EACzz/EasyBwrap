@@ -1290,6 +1290,9 @@ def build_proxy_cmd(eff: EffectivePreset, bus_path: str) -> list[str]:
     proxy = shutil.which("xdg-dbus-proxy") or "xdg-dbus-proxy"
     rt_dir = runtime_dir()
     cmd = [proxy, dbus_bus_address(rt_dir), bus_path]
+    # xdg-dbus-proxy 默认是"无过滤透传"模式, 必须显式给出 --filter,
+    # 其后的 --talk/--see/--own 策略才会被强制执行 (支持 "org.foo.*" 通配符)。
+    cmd.append("--filter")
     for name in eff.dbus_whitelist:
         cmd.append(f"--talk={name}")
     return cmd

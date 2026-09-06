@@ -33,7 +33,18 @@ blocklist = ["/", "/etc", "/usr", "/opt", "/sys", "/dev", "/run", "/proc", "~:ex
 # 其他常用敏感路径参考: "~/.gnupg" "~/.aws" "~/.config" "~/.local" "~/.cache"
 #                      "~/.password-store" "~/.netrc" "~/.git-credentials"
 dbus = "off"        # off: 不开放 | proxy: 过滤代理 | direct: 直接绑定宿主总线
-dbus_whitelist = ["org.freedesktop.portal.*", "org.fcitx.Fcitx5"]
+# dbus=proxy 时生效: 允许沙箱内应用访问的 D-Bus 名称 (xdg-dbus-proxy 白名单)。
+#   * 支持 "前缀.*" 通配符; 名称须与总线上实际使用的 well-known 名一致
+#     (服务激活名可查 /usr/share/dbus-1/services/*.service 的 Name= 字段)。
+#   * proxy = 默认拒绝 + 显式允许: 未列入的名称一律不可见/不可达, 激活也被拦截。
+#   * extends 引用预设时, 若不希望继承这里的列表, 在自身预设内整体重写
+#     (dbus_whitelist 是"整体替换"语义, 不与引用预设/全局合并)。
+#   * 仅供本机本地服务共享, 不按"沙箱外可远程触达"场景取舍。
+# 以下为常用且安全的本机桌面/输入法服务(按需增删):
+dbus_whitelist = [
+  "org.freedesktop.portal.*",   # xdg-desktop-portal 门户(截图/文件选择/剪贴板等, 按需)
+  "org.fcitx.Fcitx5",           # fcitx5 输入法
+]
 
 # ---------- 特性全局默认 (各预设可覆盖) ----------
 [features]
