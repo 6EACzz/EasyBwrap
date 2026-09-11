@@ -1,50 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""run-sandbox — 配置驱动的通用 bwrap 沙箱启动器（Python 重写版）
+"""EasyBwrap — 配置驱动的通用 bubblewrap 应用沙箱启动器
 
-与旧版 run-sandbox.sh 的区别 / 改进:
-  * Python 在启动时一次性解析并编译整个脚本, 运行期间修改脚本文件不会影响本次运行;
-  * 使用标准库 tomllib 解析 TOML, 不再手写逐行解析, 引号/注释/类型错误都能可靠处理;
-  * --print 仅打印将要执行的命令, 不启动 bwrap / xdg-dbus-proxy, 不做交互确认;
-  * --override KEY=VALUE 可多次出现, 在运行时临时覆盖参数 (优先级最高);
-  * --as/--preset PRESET 可借用某一预设的沙箱配置, 运行另一个预设的程序或自定义可执行程序;
-  * 预设可通过 extends 引用另一预设, 优先级:
-        全局默认([features]/[general]) < extends 引用的预设 < 预设自身配置 < --override
-  * [seccomp] 支持 default + 多个自定义过滤文本 (filterA 等); 运行时生成 C
-        并即时编译, 导出 BPF 后通过 --add-seccomp-fd 传给 bwrap (参考 flatpak);
-  * X11 display 在 200..999 动态分配, 避免硬编码编号冲突。
+特性:
+  * 声明式 TOML 配置体系，支持全局默认 [defaults]、预设继承 (extends) 与细粒度覆盖;
+  * Pasta 用户态网络隔离 (net = "isolated" | "shared" | "off")，防止 X11 抽象套接字逃逸;
+  * systemd 作用域集成 (systemd-run --user --scope) 与 Cgroup v2 资源约束 (内存/CPU/任务数/IO);
+  * Seccomp 动态安全过滤 (JIT 编译 BPF 字节码并自动缓存)，支持 TIOCSTI 防护与 compat32;
+  * 完整的图形与媒体直通 (Wayland / Pipewire / 动态隔离 X11 会话);
+  * 进程生命周期与状态管理 (ps / stop / kill)，支持平滑升级与优雅退出。
 
 用法:
-  run-sandbox [选项] [<预设名|别名>] [程序参数...]
-  run-sandbox edit [编辑器参数...]
-  run-sandbox ps [--json]                     # 列出正在运行的任务
-  run-sandbox stop <run-id>                   # 中断 (SIGINT, 按需升级)
-  run-sandbox kill <run-id>                   # 强行停止 (SIGKILL)
+  easy-bwrap [选项] [<预设名|别名>] [程序参数...]
+  easy-bwrap edit [编辑器参数...]
+  easy-bwrap ps [--json]                     # 列出正在运行的任务
+  easy-bwrap stop <run-id>                   # 中断任务 (SIGINT -> SIGTERM -> SIGKILL)
+  easy-bwrap kill <run-id>                   # 强行停止任务 (SIGKILL)
 
-ps/stop/kill/edit 为保留命令; 若配置中恰有同名预设/别名, 该名称优先解析为预设。
+选项:
+  -h, --help                 显示帮助信息
+  --print                    仅打印将执行的命令脚本，不实际启动
+  --override KEY=VALUE       临时覆盖配置参数 (可多次使用)
+  --as, --preset PRESET      借用某一预设的沙箱环境运行自定义程序
 
-选项 (只能出现在 <程序> 之前; 程序及其参数永远放在末尾):
-  -h, --help                 显示本帮助
-  --print                    仅打印拟执行的命令, 不实际运行任何程序
-  --override KEY=VALUE       临时覆盖参数, 可重复使用
-                             (特性/dbus/dbus_whitelist/setenv/bind/security/blocklist/program)
-  --as, --preset PRESET      使用 PRESET(预设名或别名) 的沙箱配置; 其后的程序可以是:
-                             - 另一已登记预设名/别名 (执行该预设的 program)
-                             - 自定义可执行文件 (绝对/相对路径, 或 PATH 中的命令;
-                               当前目录下的裸文件名请写成 ./foo)
-
-示例:
-  run-sandbox                                    # 运行 [general] default
-  run-sandbox zsh -l                             # 运行 zsh 预设
-  run-sandbox --print splayer file.mp4           # 只打印 bwrap 命令
-  run-sandbox --override pwd=on --override dbus=off opencode
-  run-sandbox --as zsh opencode --some-flag      # 用 zsh 的沙箱配置运行 opencode 的程序
-  run-sandbox --as zsh --override net=off /opt/bin/custom --arg
-
-配置: 默认使用本脚本同目录的 run-sandbox.toml, 可用环境变量 RUN_SANDBOX_CONF 覆盖。
-状态: 每个运行任务在 [general] state_dir 下有唯一子目录, 退出或被 stop/kill 后自动清理。
-原则: 显式指定才分配 —— 未列出的特性/绑定/程序一律不生效
-(唯一例外: seccomp 特性默认 true, 可在 [features] 或预设中显式关闭)。
+配置与状态:
+  默认加载同目录下的 easy-bwrap.toml (兼容 run-sandbox.toml)，可通过 EASY_BWRAP_CONF 覆盖。
+  运行任务在 [general] state_dir 下建立专属临时目录，退出后自动清理。
 """
 
 from __future__ import annotations
@@ -66,6 +47,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NoReturn
 
 try:
     import tomllib
@@ -94,13 +76,59 @@ FEATURES = (
     "seccomp",
 )
 FEATURE_SET = set(FEATURES)
-# 兼容旧名: home_virtual -> vhome; new_session -> vtty
-FEATURE_ALIASES = {"home_virtual": "vhome", "new_session": "vtty"}
-# seccomp 是安全过滤开关, 与普通 feature 一样参与全局默认/预设覆盖/--override,
-# 但其默认值为 true (在 load_config 初始化 feature_defaults 时处理)。
+# 兼容别名与下划线写法
+FEATURE_ALIASES = {
+    "home_virtual": "vhome",
+    "new_session": "vtty",
+    "gpu_nv": "gpu.nv",
+    "gpu_dri": "gpu.dri",
+}
+# seccomp 是安全过滤开关, 默认开启
 FEATURE_DEFAULT_TRUE = {"seccomp"}
 DBUS_MODES = ("off", "proxy", "direct")
+NET_MODES = ("off", "isolated", "shared")
 BIND_MODES = ("rw", "rw-try", "create", "ro", "ro-try")
+
+
+def parse_net_mode(value: object, where: str) -> str:
+    """解析网络模式为三挡位: off(关闭) / isolated(隔离, 基于 pasta) / shared(共享宿主网络)。"""
+    if isinstance(value, bool):
+        return "isolated" if value else "off"
+    if isinstance(value, int):
+        return "isolated" if value else "off"
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("off", "false", "no", "0", "none", "disabled"):
+            return "off"
+        if v in ("isolated", "pasta", "sandbox", "private", "true", "yes", "1", "on"):
+            return "isolated"
+        if v in ("shared", "host", "direct", "raw"):
+            return "shared"
+        abort(
+            f"{where} 的 net 须为 off|isolated|shared (或 true|false): {value}"
+        )
+    abort(f"{where} 的 net 须为 off|isolated|shared (或 true|false)")
+
+
+SYSTEMD_MODES = ("auto", "on", "off")
+
+
+def parse_systemd_mode(value: object, where: str) -> str:
+    """解析 systemd 运行模式: auto(自动探测) / on(强制开启) / off(禁用)。"""
+    if isinstance(value, bool):
+        return "auto" if value else "off"
+    if isinstance(value, int):
+        return "auto" if value else "off"
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("auto", "detect"):
+            return "auto"
+        if v in ("on", "true", "yes", "1", "enabled"):
+            return "on"
+        if v in ("off", "false", "no", "0", "disabled", "none"):
+            return "off"
+        abort(f"{where} 须为 auto|on|off (或 true|false): {value}")
+    abort(f"{where} 须为 auto|on|off (或 true|false)")
 
 
 def canonical_feature(name: str) -> str:
@@ -112,34 +140,46 @@ class _ShellRef(str):
     pass
 
 
-RUN_DIR_ARG = _ShellRef('"$RUN_SANDBOX_RUN_DIR"')
-DBUS_BUS_ARG = _ShellRef('"$RUN_SANDBOX_RUN_DIR/dbus/bus"')
-VHOME_DIR_ARG = _ShellRef('"$RUN_SANDBOX_RUN_DIR/vhome"')
+RUN_DIR_ARG = _ShellRef('"$EASY_BWRAP_RUN_DIR"')
+DBUS_BUS_ARG = _ShellRef('"$EASY_BWRAP_RUN_DIR/dbus/bus"')
+VHOME_DIR_ARG = _ShellRef('"$EASY_BWRAP_RUN_DIR/vhome"')
 
 # X11: 在高端范围动态分配 display 号, 避免与宿主 X server / 其他实例冲突
 X11_DISPLAY_MIN = 200
 X11_DISPLAY_MAX = 999
+X11_LOCKS_DIRNAME = ".x11-locks"
+SECCOMP_CACHE_DIRNAME = ".seccomp-cache"
 
 
 def x11_wrap_script(display: int) -> str:
     return f"""\
 mkdir -p /tmp/.X11-unix
-xwayland-satellite :{display} >/dev/null 2>&1 &
-i=0
-while [ "$i" -lt 40 ] && [ ! -S /tmp/.X11-unix/X{display} ]; do
+_x11_log=$(mktemp -t xwayland-XXXXXX.log 2>/dev/null || echo "/tmp/xwayland-$$.log")
+xwayland-satellite :{display} >"$_x11_log" 2>&1 &
+_x11_pid=$!
+_x11_i=0
+while [ "$_x11_i" -lt 40 ] && [ ! -S /tmp/.X11-unix/X{display} ]; do
+  if ! kill -0 "$_x11_pid" 2>/dev/null; then
+    break
+  fi
   sleep 0.05
-  i=$((i+1))
+  _x11_i=$((_x11_i+1))
 done
+if [ ! -S /tmp/.X11-unix/X{display} ]; then
+  echo "[easy-bwrap] 错误: xwayland-satellite 启动失败或未能创建 X11 套接字 (:{display}):" >&2
+  cat "$_x11_log" >&2
+fi
+rm -f "$_x11_log" 2>/dev/null
 exec "$@"
 """
 
 USAGE = """\
 用法:
-  run-sandbox [选项] [<预设名|别名>] [程序参数...]
-  run-sandbox edit [编辑器参数...]
-  run-sandbox ps [--json]                     # 列出正在运行的任务
-  run-sandbox stop <run-id>                   # 中断 (SIGINT, 按需升级)
-  run-sandbox kill <run-id>                   # 强行停止 (SIGKILL)
+  easy-bwrap [选项] [<预设名|别名>] [程序参数...]
+  easy-bwrap edit [编辑器参数...]
+  easy-bwrap ps [--json]                     # 列出正在运行的任务
+  easy-bwrap stop <run-id>                   # 中断任务 (SIGINT -> SIGTERM -> SIGKILL)
+  easy-bwrap kill <run-id>                   # 强行停止任务 (SIGKILL)
 
 ps/stop/kill/edit 为保留命令; 若配置中恰有同名预设/别名, 该名称优先解析为预设。
 
@@ -150,31 +190,49 @@ ps/stop/kill/edit 为保留命令; 若配置中恰有同名预设/别名, 该名
   --as, --preset PRESET      使用 PRESET(预设名或别名) 的沙箱配置运行另一预设程序或自定义程序
 
 --override 支持的 KEY:
-  base gpu.nv gpu.dri tmpfs shm pwd net vtty wayland pipewire x11 vhome seccomp
+  base gpu_nv gpu_dri tmpfs shm pwd vtty wayland pipewire x11 vhome seccomp
     (取值: on|off 或 true|false|yes|no|1|0; seccomp 还可取 [seccomp] 配置名)
+  net         off|isolated|shared (也可取布尔: true=isolated, false=off)
+  systemd     auto|on|off (也可取布尔: true=auto, false=off)
+  slice       systemd slice 组名 (默认 app.slice)
+  memory_max  cgroup 内存上限 (如 4G, 512M)
+  memory_high cgroup 内存高水位限流阈值 (如 3G)
+  cpu_quota   cgroup CPU 配额 (如 200%, 50%)
+  tasks_max   cgroup 最大任务数 (如 500)
+  io_weight   cgroup IO 权重 (1..1000)
   dbus        off|proxy|direct
-  dbus_whitelist  逗号/空格分隔的 D-Bus 名称, 追加到白名单
-  setenv     K=V (可重复, 覆盖同名变量)
-  bind       src[:dst][:mode], 追加绑定 (mode: rw|rw-try|create|ro|ro-try)
-  security   on|off
-  blocklist  路径[:exact], 追加到安全黑名单
-  program    绝对路径 (或 PATH 命令), 覆盖本次执行的程序入口
+  dbus_whitelist  D-Bus 名称[:策略], 追加到白名单 (策略: talk|own, 缺省 talk)
+  setenv      K=V (可重复, 覆盖同名变量)
+  bind        src[:dst][:mode], 追加绑定 (mode: rw|rw-try|create|ro|ro-try)
+  security    on|off
+  blocklist   路径[:exact], 追加到安全黑名单
+  program     绝对路径 (或 PATH 命令), 覆盖本次执行的程序入口
 
-状态目录: [general] state_dir (默认 /tmp/run-sandbox-state), 每个运行任务使用
+状态目录: [general] state_dir (默认 /tmp/easy-bwrap-state), 每个运行任务使用
 该目录下唯一的 <预设名>.<随机串>/ 子目录记录运行信息, 退出后自动清理。
 
-seccomp: 配置文件末尾的 [seccomp] 可放多个多行过滤文本; default 为默认档,
-其他键为自定义档。preset/--override 中 seccomp=true 用 default,
-seccomp="配置名" 选自定义档, seccomp=false 关闭。启用时即时编译并导出 BPF,
-通过 --add-seccomp-fd 传给 bwrap。首次编译结果缓存在
-<state_dir>/.seccomp-cache/, 文件名含文本 BLAKE2b 哈希, 缓存不自动清理。
-X11 display 编号在 200..999 动态分配, 避免与宿主/其他实例冲突。
+网络模式 (net):
+  isolated: (默认) 使用 pasta 创建独立网络命名空间并提供用户态网络, 彻底隔绝宿主
+            网络套接字及窗口管理器创建的 X11 抽象套接字 (@/tmp/.X11-unix/X*)
+  shared:   共享宿主网络命名空间, 可直通宿主局域网 (但存在 X11 抽象套接字逃逸风险)
+  off:      完全断开网络 (--unshare-net, 无网络接口)
+
+systemd 集成:
+  auto: (默认) 自动探测 systemd --user; 若可用则通过 systemd-run --user --scope
+        将沙盒置于独立的 transient scope cgroup 中运行, 具备 cgroup 资源配额与原子
+        生命周期管理; 若不可用则自动降级为原生进程管理
+  on:   强制使用 systemd 作用域; 若 systemd --user 不可用则报错退出
+  off:  完全禁用 systemd 集成, 始终使用内置直接进程管理
+
+seccomp: 配置文件中的 [seccomp] 提供系统调用过滤规则; default 为默认规则集。
+预设中 seccomp=true 用 default, seccomp="配置名" 选自定义规则, seccomp=false 关闭。
+启用时依据规则即时编译并缓存 BPF 字节码, 通过 --add-seccomp-fd 传给 bwrap。
 
 示例:
-  run-sandbox --print splayer file.mp4
-  run-sandbox --override pwd=on --override dbus=off opencode
-  run-sandbox --as zsh opencode --some-flag
-  run-sandbox --as zsh --override net=off /opt/bin/custom --arg
+  easy-bwrap --print splayer file.mp4
+  easy-bwrap --override pwd=on --override dbus=off opencode
+  easy-bwrap --as zsh opencode --some-flag
+  easy-bwrap --as zsh --override net=off /opt/bin/custom --arg
 """
 
 
@@ -182,7 +240,7 @@ class Abort(Exception):
     """配置或运行错误: 打印 Abort 后以非零状态退出。"""
 
 
-def abort(message: str) -> "Abort":
+def abort(message: str) -> NoReturn:
     raise Abort(message)
 
 
@@ -195,7 +253,6 @@ def shlex_split_safe(text: str, where: str) -> list[str]:
         return shlex.split(text)
     except ValueError as exc:
         abort(f"{where} 无法按 shell 语法解析: {exc}")
-    raise AssertionError("unreachable")
 
 
 def normalize_rc(rc: int) -> int:
@@ -207,7 +264,6 @@ def run_cmd(argv: list[str]) -> int:
         return subprocess.run(argv).returncode
     except OSError as exc:
         abort(f"无法执行 {argv[0] if argv else '<空命令>'}: {exc}")
-        raise AssertionError("unreachable")
 
 
 def shell_join_argv(argv: list[str]) -> str:
@@ -313,11 +369,22 @@ def parse_cli(argv: list[str]) -> CliOptions:
 
 
 def find_config_path() -> Path:
-    env = os.environ.get("RUN_SANDBOX_CONF")
-    path = Path(os.path.expanduser(env)) if env else SCRIPT_DIR / "run-sandbox.toml"
-    if not path.is_file():
-        abort(f"找不到配置文件 {path}")
-    return path
+    env = os.environ.get("EASY_BWRAP_CONF") or os.environ.get("RUN_SANDBOX_CONF")
+    if env:
+        path = Path(os.path.expanduser(env))
+        if not path.is_file():
+            abort(f"找不到指定的配置文件: {path}")
+        return path
+
+    for candidate in ("easy-bwrap.toml", "run-sandbox.toml"):
+        p = SCRIPT_DIR / candidate
+        if p.is_file():
+            return p
+
+    abort(
+        f"找不到配置文件: 已搜索 {SCRIPT_DIR / 'easy-bwrap.toml'} "
+        f"及 {SCRIPT_DIR / 'run-sandbox.toml'}"
+    )
 
 
 def open_config_trusted(path: Path):
@@ -381,11 +448,19 @@ class PresetRaw:
     extends: str | None = None
     aliases: list[str] = field(default_factory=list)
     feature_overrides: dict[str, bool] = field(default_factory=dict)
+    net: str | None = None
     dbus: str | None = None
     dbus_whitelist: list[str] | None = None
     setenv: list[tuple[str, str]] | None = None
     binds: list[BindSpec] | None = None
     seccomp_profile: str | None = None
+    systemd: str | None = None
+    slice: str | None = None
+    memory_max: str | None = None
+    memory_high: str | None = None
+    cpu_quota: str | None = None
+    tasks_max: str | None = None
+    io_weight: str | None = None
 
 
 @dataclass
@@ -393,6 +468,14 @@ class EffectivePreset:
     name: str
     program: str = ""
     features: dict[str, bool] = field(default_factory=dict)
+    net: str = "isolated"
+    systemd: str = "auto"
+    slice: str = "app.slice"
+    memory_max: str | None = None
+    memory_high: str | None = None
+    cpu_quota: str | None = None
+    tasks_max: str | None = None
+    io_weight: str | None = None
     dbus: str = "off"
     dbus_whitelist: list[str] = field(default_factory=list)
     setenv: dict[str, str] = field(default_factory=dict)
@@ -409,14 +492,16 @@ class GeneralCfg:
     blocklist: list[tuple[str, str]] = field(default_factory=list)
     dbus: str = "off"
     dbus_whitelist: list[str] = field(default_factory=list)
-    state_dir: str = "/tmp/run-sandbox-state"
+    state_dir: str = "/tmp/easy-bwrap-state"
+    systemd: str = "auto"
+    slice: str = "app.slice"
 
 
 @dataclass
 class Config:
     path: Path
     general: GeneralCfg
-    feature_defaults: dict[str, bool]
+    feature_defaults: dict[str, Any]
     aliases: dict[str, str]
     presets: dict[str, PresetRaw]
     effective: dict[str, EffectivePreset] = field(default_factory=dict)
@@ -467,7 +552,6 @@ def parse_cli_bool(value: str, key: str) -> bool:
     if v in ("off", "false", "no", "0"):
         return False
     abort(f"--override {key} 的值须为 on|off (或 true|false|yes|no|1|0): {value}")
-    raise AssertionError("unreachable")
 
 
 def parse_dbus_mode(value: object, where: str) -> str:
@@ -477,6 +561,42 @@ def parse_dbus_mode(value: object, where: str) -> str:
     if mode not in DBUS_MODES:
         abort(f"{where} 须为 off|proxy|direct (on 已废弃, 请用 proxy): {value}")
     return mode
+
+
+# dbus_whitelist 条目可选的策略后缀; 缺省为 talk (向后兼容旧裸名称写法)。
+DBUS_POLICIES = ("talk", "own")
+DBUS_POLICY_DEFAULT = "talk"
+
+
+def parse_dbus_policy_entry(entry: str, where: str) -> tuple[str, str]:
+    """把 dbus_whitelist 的一条解析为 (名称, 策略)。
+
+    语法: "<名称>[:<策略>]", 策略为 talk|own, 缺省 talk。
+    D-Bus well-known 名称不含冒号, 因此以最后一个冒号切分是安全的;
+    注意 xdg-dbus-proxy 的 --talk/--own 本身接受 "前缀.*" 通配符。
+    """
+    text = entry.strip()
+    if not text:
+        abort(f"{where} 的 dbus_whitelist 条目不能为空")
+    if ":" in text:
+        name, _, policy = text.rpartition(":")
+        policy = policy.strip().lower()
+        name = name.strip()
+        if policy not in DBUS_POLICIES:
+            abort(
+                f"{where} 的 dbus_whitelist 条目 '{entry}' 策略 '{policy}' 非法; "
+                f"可用: {'|'.join(DBUS_POLICIES)} (缺省 talk)"
+            )
+        if not name:
+            abort(f"{where} 的 dbus_whitelist 条目 '{entry}' 缺少 D-Bus 名称")
+        return name, policy
+    return text, DBUS_POLICY_DEFAULT
+
+
+def canonical_dbus_entry(entry: str, where: str) -> str:
+    """规范化单条为 '名称:策略', 使各处合并/继承结果一致。"""
+    name, policy = parse_dbus_policy_entry(entry, where)
+    return f"{name}:{policy}"
 
 
 def split_list_value(value: object, where: str) -> list[str]:
@@ -495,6 +615,16 @@ def split_list_value(value: object, where: str) -> list[str]:
     abort(f"{where} 须为字符串或字符串数组")
 
 
+def expand_env_value(val: str) -> str:
+    """展开环境变量值中的波浪号 (~)。支持单个路径或冒号分隔的 PATH 式多路径。"""
+    if "~" not in val:
+        return val
+    if ":" in val:
+        parts = val.split(":")
+        return ":".join(os.path.expanduser(p) if p.startswith("~") else p for p in parts)
+    return os.path.expanduser(val) if val.startswith("~") else val
+
+
 def parse_setenv(value: object, where: str) -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
 
@@ -505,7 +635,7 @@ def parse_setenv(value: object, where: str) -> list[tuple[str, str]]:
         key = key.strip()
         if not key:
             abort(f"{where} 的 setenv 条目变量名不能为空: {kv}")
-        result.append((key, val))
+        result.append((key, expand_env_value(val)))
 
     if isinstance(value, dict):
         for key, val in value.items():
@@ -516,7 +646,7 @@ def parse_setenv(value: object, where: str) -> list[tuple[str, str]]:
                 text = "true" if val else "false"
             else:
                 text = str(val)
-            result.append((key, text))
+            result.append((key, expand_env_value(text)))
         return result
 
     if isinstance(value, str):
@@ -532,7 +662,6 @@ def parse_setenv(value: object, where: str) -> list[tuple[str, str]]:
         return result
 
     abort(f"{where} 的 setenv 须为 K=V 字符串、字符串数组或表 (如 {{ K = \"V\" }})")
-    raise AssertionError("unreachable")
 
 
 def parse_bind_string(item: str, where: str) -> BindSpec:
@@ -661,6 +790,12 @@ def parse_general(table: dict) -> GeneralCfg:
             general.dbus = parse_dbus_mode(value, "[general] dbus")
         elif key == "dbus_whitelist":
             general.dbus_whitelist = split_list_value(value, "[general] dbus_whitelist")
+        elif key == "systemd":
+            general.systemd = parse_systemd_mode(value, "[general] systemd")
+        elif key == "slice":
+            if not isinstance(value, str) or not value.strip():
+                abort("[general] slice 须为非空字符串 (例如 'app.slice')")
+            general.slice = value.strip()
         else:
             abort(f"[general] 未知键 '{key}'")
     return general
@@ -682,7 +817,6 @@ def parse_preset_aliases(value: object, where: str) -> list[str]:
             abort(f"{where} alias 数组不能为空")
         return aliases
     abort(f"{where} alias 须为字符串或字符串数组")
-    raise AssertionError("unreachable")
 
 
 SECCOMP_DEFAULT_ACTIONS = ("allow", "deny", "errno", "kill", "log")
@@ -741,6 +875,10 @@ def parse_seccomp_filter(text: str, where: str = "[seccomp] profile") -> Seccomp
             if len(tokens) != 1:
                 abort(f"{where} 第 {lineno} 行: tiocsti 不接受参数")
             profile.rules.append(SeccompRule("tiocsti", []))
+        elif action == "compat32":
+            if len(tokens) != 1:
+                abort(f"{where} 第 {lineno} 行: compat32 不接受参数")
+            profile.rules.append(SeccompRule("compat32", []))
         elif action in ("allow", "kill", "log"):
             if len(tokens) < 2:
                 abort(f"{where} 第 {lineno} 行: {action} 需要至少一个系统调用")
@@ -752,7 +890,7 @@ def parse_seccomp_filter(text: str, where: str = "[seccomp] profile") -> Seccomp
         else:
             abort(
                 f"{where} 第 {lineno} 行: 未知动作 '{action}' "
-                "(可用: allow|deny|errno <CODE>|kill|log|tiocsti|default ...)"
+                "(可用: allow|deny|errno <CODE>|kill|log|tiocsti|compat32|default ...)"
             )
 
         for syscall in profile.rules[-1].syscalls:
@@ -783,10 +921,14 @@ def parse_seccomp_table(value: object) -> dict[str, SeccompProfile]:
 
 
 def parse_presets(raw: dict) -> dict[str, PresetRaw]:
-    presets_table = _table(raw.get("preset", {}), "[preset]")
+    if "preset" in raw and "presets" in raw:
+        abort("配置文件不能同时包含 [preset] 与 [presets], 请统一使用 [presets]")
+    presets_key = "presets" if "presets" in raw else "preset"
+    presets_raw = raw.get(presets_key, {})
+    presets_table = _table(presets_raw, f"[{presets_key}]")
     presets: dict[str, PresetRaw] = {}
     for name, table in presets_table.items():
-        where = f"[preset.{name}]"
+        where = f"[{presets_key}.{name}]"
         section = _table(table, where)
         preset = PresetRaw(section=where)
         for key, value in section.items():
@@ -815,6 +957,24 @@ def parse_presets(raw: dict) -> dict[str, PresetRaw]:
                     preset.seccomp_profile = profile_name
                 else:
                     abort(f"{where} seccomp 须为 true|false 或 [seccomp] 中的配置文件名")
+            elif key == "net":
+                preset.net = parse_net_mode(value, f"{where} net")
+            elif key == "systemd":
+                preset.systemd = parse_systemd_mode(value, f"{where} systemd")
+            elif key == "slice":
+                if not isinstance(value, str) or not value.strip():
+                    abort(f"{where} slice 须为非空字符串 (例如 'app.slice')")
+                preset.slice = value.strip()
+            elif key in ("memory_max", "memory_high", "cpu_quota", "tasks_max", "io_weight"):
+                if isinstance(value, (int, float)):
+                    setattr(preset, key, str(value))
+                elif isinstance(value, str):
+                    val_str = value.strip()
+                    if not val_str:
+                        abort(f"{where} {key} 须为非空字符串或数字")
+                    setattr(preset, key, val_str)
+                else:
+                    abort(f"{where} {key} 须为字符串或数字")
             elif feature_key in FEATURE_SET:
                 preset.feature_overrides[feature_key] = parse_bool(value, f"{where} {key}")
             elif key == "dbus":
@@ -833,13 +993,45 @@ def parse_presets(raw: dict) -> dict[str, PresetRaw]:
                     canonical = canonical_feature(full)
                     if canonical not in FEATURE_SET:
                         known = ", ".join(
-                            ["program", "alias", "extends", "dbus", "dbus_whitelist", "setenv", "bind", *FEATURES]
+                            [
+                                "program",
+                                "alias",
+                                "extends",
+                                "systemd",
+                                "slice",
+                                "memory_max",
+                                "memory_high",
+                                "cpu_quota",
+                                "tasks_max",
+                                "io_weight",
+                                "dbus",
+                                "dbus_whitelist",
+                                "setenv",
+                                "bind",
+                                *FEATURES,
+                            ]
                         )
                         abort(f"{where} 未知键 '{full}' (可用: {known})")
                     preset.feature_overrides[canonical] = parse_bool(value=leaf, where=f"{where} {full}")
             else:
                 known = ", ".join(
-                    ["program", "alias", "extends", "dbus", "dbus_whitelist", "setenv", "bind", *FEATURES]
+                    [
+                        "program",
+                        "alias",
+                        "extends",
+                        "systemd",
+                        "slice",
+                        "memory_max",
+                        "memory_high",
+                        "cpu_quota",
+                        "tasks_max",
+                        "io_weight",
+                        "dbus",
+                        "dbus_whitelist",
+                        "setenv",
+                        "bind",
+                        *FEATURES,
+                    ]
                 )
                 abort(f"{where} 未知键 '{key}' (可用: {known})")
         presets[str(name)] = preset
@@ -864,8 +1056,19 @@ def compute_effective(config: Config) -> dict[str, EffectivePreset]:
                 name=name,
                 program="",
                 features=dict(config.feature_defaults),
+                net=str(config.feature_defaults.get("net", "isolated")),
+                systemd=config.general.systemd,
+                slice=config.general.slice,
+                memory_max=None,
+                memory_high=None,
+                cpu_quota=None,
+                tasks_max=None,
+                io_weight=None,
                 dbus=config.general.dbus,
-                dbus_whitelist=list(config.general.dbus_whitelist),
+                dbus_whitelist=[
+                    canonical_dbus_entry(e, raw.section)
+                    for e in config.general.dbus_whitelist
+                ],
                 setenv={},
                 binds=[],
                 chain=[name],
@@ -882,8 +1085,16 @@ def compute_effective(config: Config) -> dict[str, EffectivePreset]:
                 name=name,
                 program=base.program,
                 features=dict(base.features),
+                net=base.net,
+                systemd=base.systemd,
+                slice=base.slice,
+                memory_max=base.memory_max,
+                memory_high=base.memory_high,
+                cpu_quota=base.cpu_quota,
+                tasks_max=base.tasks_max,
+                io_weight=base.io_weight,
                 dbus=base.dbus,
-                dbus_whitelist=list(base.dbus_whitelist),
+                dbus_whitelist=[canonical_dbus_entry(e, raw.section) for e in base.dbus_whitelist],
                 setenv=dict(base.setenv),
                 binds=list(base.binds),
                 seccomp_profile=base.seccomp_profile,
@@ -895,10 +1106,29 @@ def compute_effective(config: Config) -> dict[str, EffectivePreset]:
         if raw.seccomp_profile is not None:
             eff.seccomp_profile = raw.seccomp_profile
         eff.features.update(raw.feature_overrides)
+        if raw.net is not None:
+            eff.net = raw.net
+        eff.features["net"] = (eff.net != "off")
+        if raw.systemd is not None:
+            eff.systemd = raw.systemd
+        if raw.slice is not None:
+            eff.slice = raw.slice
+        if raw.memory_max is not None:
+            eff.memory_max = raw.memory_max
+        if raw.memory_high is not None:
+            eff.memory_high = raw.memory_high
+        if raw.cpu_quota is not None:
+            eff.cpu_quota = raw.cpu_quota
+        if raw.tasks_max is not None:
+            eff.tasks_max = raw.tasks_max
+        if raw.io_weight is not None:
+            eff.io_weight = raw.io_weight
         if raw.dbus is not None:
             eff.dbus = raw.dbus
         if raw.dbus_whitelist is not None:
-            eff.dbus_whitelist = list(raw.dbus_whitelist)
+            eff.dbus_whitelist = [
+                canonical_dbus_entry(e, raw.section) for e in raw.dbus_whitelist
+            ]
         if raw.setenv is not None:
             for key, value in raw.setenv:
                 eff.setenv[key] = value
@@ -933,15 +1163,15 @@ def load_config(path: Path) -> Config:
     finally:
         handle.close()
 
-    allowed_top = {"general", "features", "preset", "seccomp"}
+    allowed_top = {"general", "defaults", "features", "presets", "preset", "seccomp"}
     if "program" in raw:
         abort(
-            "检测到旧版配置结构 ([program] 表); 新格式使用 [preset.<名称>] 表, "
+            "检测到旧版配置结构 ([program] 表); 新格式使用 [presets.<名称>] 表, "
             "program 移入预设内, 程序特性段也合并到对应预设中。"
         )
     if "alias" in raw:
         abort(
-            "检测到旧版顶级 [alias] 段; alias 现在请写在对应 [preset.<名称>] 内 "
+            "检测到旧版顶级 [alias] 段; alias 现在请写在对应 [presets.<名称>] 内 "
             "(program 的下一行), 且 alias 不参与 extends 继承。"
         )
     unknown_top = sorted(set(raw) - allowed_top)
@@ -955,26 +1185,43 @@ def load_config(path: Path) -> Config:
 
     general = parse_general(_table(raw.get("general", {}), "[general]"))
 
-    feature_defaults: dict[str, bool] = {
+    if "features" in raw and "defaults" in raw:
+        abort("配置文件不能同时包含 [features] 与 [defaults], 请统一使用 [defaults]")
+    defaults_key = "defaults" if "defaults" in raw else "features"
+    defaults_raw = raw.get(defaults_key, {})
+    defaults_table = _table(defaults_raw, f"[{defaults_key}]")
+
+    feature_defaults: dict[str, Any] = {
         name: (name in FEATURE_DEFAULT_TRUE) for name in FEATURES
     }
-    features_table = _table(raw.get("features", {}), "[features]")
-    for key, value in features_table.items():
+    feature_defaults["net"] = "isolated"
+    for key, value in defaults_table.items():
         if isinstance(value, dict):
-            ensure_no_empty_tables(value, f"[features] {key}")
-    for key, value in flatten_dotted(features_table):
+            ensure_no_empty_tables(value, f"[{defaults_key}] {key}")
+    for key, value in flatten_dotted(defaults_table):
         if key == "security":
             abort("security 已并入 [general] (security = true|false)")
         if key == "dbus":
-            abort("dbus 现为 off|proxy|direct, 请配置在 [general] 或 [preset.*]")
+            abort(f"dbus 现为 off|proxy|direct, 请配置在 [general] 或预设自身")
+        if key == "systemd":
+            general.systemd = parse_systemd_mode(value, f"[{defaults_key}] systemd")
+            continue
+        if key == "slice":
+            if not isinstance(value, str) or not value.strip():
+                abort(f"[{defaults_key}] slice 须为非空字符串")
+            general.slice = value.strip()
+            continue
+        if key == "net":
+            feature_defaults["net"] = parse_net_mode(value, f"[{defaults_key}] net")
+            continue
         canonical = canonical_feature(key)
         if canonical not in FEATURE_SET:
-            abort(f"[features] 未知键 '{key}' (可用: {', '.join(FEATURES)})")
-        feature_defaults[canonical] = parse_bool(value, f"[features] {key}")
+            abort(f"[{defaults_key}] 未知键 '{key}' (可用: {', '.join(FEATURES)})")
+        feature_defaults[canonical] = parse_bool(value, f"[{defaults_key}] {key}")
 
     presets = parse_presets(raw)
     if not presets:
-        abort("[preset] 未登记任何预设")
+        abort("未登记任何预设 (需配置 [presets.<名称>])")
 
     seccomp_profiles: dict[str, SeccompProfile] = {}
     if "seccomp" in raw:
@@ -1076,15 +1323,31 @@ def apply_overrides(
             continue
 
         feature_key = canonical_feature(key)
-        if feature_key in FEATURE_SET:
+        if feature_key == "net":
+            eff.net = parse_net_mode(value, "--override net")
+            eff.features["net"] = (eff.net != "off")
+        elif feature_key in FEATURE_SET:
             eff.features[feature_key] = parse_cli_bool(value, key)
+        elif key == "systemd":
+            eff.systemd = parse_systemd_mode(value, "--override systemd")
+        elif key == "slice":
+            if not value.strip():
+                abort("--override slice 不能为空")
+            eff.slice = value.strip()
+        elif key in ("memory_max", "memory_high", "cpu_quota", "tasks_max", "io_weight"):
+            val_str = value.strip()
+            if not val_str:
+                abort(f"--override {key} 不能为空")
+            setattr(eff, key, val_str)
         elif key == "dbus":
             eff.dbus = parse_dbus_mode(value, f"--override dbus")
         elif key == "dbus_whitelist":
             items = split_list_value(value, "--override dbus_whitelist")
             if not items:
                 abort("--override dbus_whitelist 不能为空")
-            eff.dbus_whitelist.extend(items)
+            eff.dbus_whitelist.extend(
+                canonical_dbus_entry(e, "--override dbus_whitelist") for e in items
+            )
         elif key == "setenv":
             if "=" not in value:
                 abort(f"--override setenv 须为 K=V: {value}")
@@ -1092,7 +1355,7 @@ def apply_overrides(
             env_key = env_key.strip()
             if not env_key:
                 abort(f"--override setenv 变量名不能为空: {value}")
-            eff.setenv[env_key] = env_val
+            eff.setenv[env_key] = expand_env_value(env_val)
         elif key == "bind":
             for bind in parse_bind(value, "--override bind"):
                 eff.binds.append(bind)
@@ -1106,7 +1369,23 @@ def apply_overrides(
             eff.program = program_override
         else:
             allowed = ", ".join(
-                [*FEATURES, "dbus", "dbus_whitelist", "setenv", "bind", "security", "blocklist", "program"]
+                [
+                    *FEATURES,
+                    "systemd",
+                    "slice",
+                    "memory_max",
+                    "memory_high",
+                    "cpu_quota",
+                    "tasks_max",
+                    "io_weight",
+                    "dbus",
+                    "dbus_whitelist",
+                    "setenv",
+                    "bind",
+                    "security",
+                    "blocklist",
+                    "program",
+                ]
             )
             abort(f"--override 未知键 '{key}' (可用: {allowed})")
     return program_override, general
@@ -1161,10 +1440,29 @@ def resolve_invocation(opts: CliOptions, config: Config) -> tuple[str, Effective
     return preset_name, config.effective[preset_name], config.effective[preset_name].program, preset_name
 
 
-def blocklist_matches(project_dir: str, root: str, mode: str) -> bool:
+def blocklist_matches(path: str, root: str, mode: str) -> bool:
     if root == "/" or mode == "exact":
-        return project_dir == root
-    return project_dir == root or project_dir.startswith(root + "/")
+        return path == root
+    return path == root or path.startswith(root + "/")
+
+
+def check_path_against_blocklist(
+    target_path: str, blocklist: list[tuple[str, str]]
+) -> tuple[bool, str]:
+    """检查规范化后的 target_path 是否命中黑名单规则。返回 (是否命中, 触发的黑名单规则)。"""
+    try:
+        norm_target = os.path.realpath(os.path.expanduser(target_path))
+    except Exception:
+        norm_target = os.path.abspath(os.path.expanduser(target_path))
+
+    for root, mode in blocklist:
+        try:
+            norm_root = os.path.realpath(os.path.expanduser(root))
+        except Exception:
+            norm_root = os.path.abspath(os.path.expanduser(root))
+        if blocklist_matches(norm_target, norm_root, mode):
+            return True, root
+    return False, ""
 
 
 def run_security_checks(
@@ -1185,26 +1483,38 @@ def run_security_checks(
     if os.getuid() == 0:
         enforce("security=on 禁止以 root 运行")
 
-    if not eff.features.get("pwd", False):
-        return
+    if eff.features.get("pwd", False):
+        if project_dir == "/":
+            enforce("security=on 禁止从 / 运行")
 
-    for root, mode in general.blocklist:
-        if blocklist_matches(project_dir, root, mode):
-            enforce(f"security=on 禁止从当前路径运行: {project_dir} (黑名单: {root})")
+        hit, rule = check_path_against_blocklist(project_dir, general.blocklist)
+        if hit:
+            enforce(f"security=on 禁止从当前路径运行: {project_dir} (黑名单: {rule})")
 
-    if project_dir == "/":
-        enforce("security=on 禁止从 / 运行")
+        home = os.path.realpath(os.path.expanduser("~"))
+        if project_dir == home:
+            warn(f"当前目录是 $HOME ({home}), 整个家目录将被 rw 绑定。")
+            if not print_mode:
+                try:
+                    answer = input("继续? [y/N] ")
+                except EOFError:
+                    answer = "n"
+                if answer.strip().lower() not in ("y", "yes"):
+                    abort("Aborted.")
 
-    home = os.path.realpath(os.path.expanduser("~"))
-    if project_dir == home:
-        warn(f"当前目录是 $HOME ({home}), 整个家目录将被 rw 绑定。")
-        if not print_mode:
-            try:
-                answer = input("继续? [y/N] ")
-            except EOFError:
-                answer = "n"
-            if answer.strip().lower() not in ("y", "yes"):
-                abort("Aborted.")
+    # 检查所有显式 bind 挂载路径
+    for b in eff.binds:
+        try:
+            norm_src = os.path.realpath(os.path.expanduser(b.src))
+        except Exception:
+            norm_src = os.path.abspath(os.path.expanduser(b.src))
+
+        if norm_src == "/" and b.mode in ("rw", "create"):
+            enforce(f"security=on 禁止以可写方式绑定根目录 /: {b.src}")
+
+        hit, rule = check_path_against_blocklist(norm_src, general.blocklist)
+        if hit:
+            enforce(f"security=on 禁止绑定黑名单路径: {b.src} (命中黑名单规则: {rule})")
 
 
 # ---------------------------------------------------------------------------
@@ -1249,8 +1559,47 @@ def host_x11_displays_in_use() -> set[int]:
     return used
 
 
-def choose_x11_display() -> int:
+def active_sandbox_x11_displays(state_dir: Path) -> set[int]:
+    """检查 state_dir 中当前存活沙箱实例所记录占用的 X11 display 编号。"""
+    used: set[int] = set()
+    try:
+        children = list(state_dir.iterdir())
+    except OSError:
+        return used
+    for child in children:
+        if child.name in (SECCOMP_CACHE_DIRNAME, X11_LOCKS_DIRNAME):
+            continue
+        if not child.is_dir() or child.is_symlink():
+            continue
+        info = read_run_info(child)
+        if info and run_info_alive(info):
+            disp = info.get("x11_display")
+            if isinstance(disp, int):
+                used.add(disp)
+    return used
+
+
+def choose_x11_display(state_dir: Path | None = None) -> int:
+    """仅做编号可用性预测选择 (用于 --print 模式), 不持有独占文件锁。"""
     used = host_x11_displays_in_use()
+    if state_dir is not None and state_dir.is_dir():
+        used |= active_sandbox_x11_displays(state_dir)
+        locks_dir = state_dir / X11_LOCKS_DIRNAME
+        if locks_dir.is_dir():
+            for item in range(X11_DISPLAY_MIN, X11_DISPLAY_MAX + 1):
+                lock_path = locks_dir / f"X{item}.lock"
+                if lock_path.is_file():
+                    try:
+                        fd = os.open(lock_path, os.O_RDONLY)
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        except (BlockingIOError, OSError):
+                            used.add(item)
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        pass
     ordered = list(range(X11_DISPLAY_MIN, X11_DISPLAY_MAX + 1))
     random.shuffle(ordered)
     for display in ordered:
@@ -1258,25 +1607,59 @@ def choose_x11_display() -> int:
             return display
     abort(
         f"无法在 {X11_DISPLAY_MIN}..{X11_DISPLAY_MAX} 范围内找到空闲的 X11 display "
-        "(宿主 /tmp/.X11-unix 已占用过多编号)"
+        "(宿主 /tmp/.X11-unix 或活跃沙箱已占用过多编号)"
     )
-    raise AssertionError("unreachable")
 
 
-def allocate_x11_display(state_dir: Path) -> int:
-    """对状态目录本身加 flock, 降低并发实例选中同一编号的概率。"""
+def ensure_x11_locks_dir(state_dir: Path) -> Path:
+    locks_dir = state_dir / X11_LOCKS_DIRNAME
     try:
-        dir_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+        locks_dir.mkdir(mode=0o700, exist_ok=True)
     except OSError as exc:
-        abort(f"无法打开状态目录 {state_dir} 进行 X11 display 分配: {exc}")
-    try:
-        fcntl.flock(dir_fd, fcntl.LOCK_EX)
-        return choose_x11_display()
-    finally:
+        abort(f"无法创建 X11 锁目录 {locks_dir}: {exc}")
+    if locks_dir.is_symlink():
+        abort(f"X11 锁目录不能是符号链接: {locks_dir}")
+    return locks_dir
+
+
+def allocate_x11_display(state_dir: Path, run_id: str) -> tuple[int, int]:
+    """分配一个独占的 X11 display 编号, 并返回 (display, lock_fd)。
+
+    在 state_dir/.x11-locks/X{display}.lock 上持有非阻塞 flock,
+    该文件描述符由调用方保持打开并在沙箱生命周期结束时关闭。
+    """
+    locks_dir = ensure_x11_locks_dir(state_dir)
+    host_used = host_x11_displays_in_use()
+    sandbox_used = active_sandbox_x11_displays(state_dir)
+    all_used = host_used | sandbox_used
+
+    ordered = list(range(X11_DISPLAY_MIN, X11_DISPLAY_MAX + 1))
+    random.shuffle(ordered)
+
+    for display in ordered:
+        if display in all_used:
+            continue
+        lock_path = locks_dir / f"X{display}.lock"
         try:
-            fcntl.flock(dir_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(dir_fd)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                os.ftruncate(fd, 0)
+                os.write(fd, f"run_id={run_id}\npid={os.getpid()}\n".encode("utf-8"))
+            except OSError:
+                pass
+            return display, fd
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            continue
+
+    abort(
+        f"无法在 {X11_DISPLAY_MIN}..{X11_DISPLAY_MAX} 范围内找到空闲的 X11 display "
+        "(宿主 /tmp/.X11-unix 或活跃沙箱已占用过多编号)"
+    )
 
 
 def dbus_bus_address(rt_dir: str) -> str:
@@ -1291,10 +1674,12 @@ def build_proxy_cmd(eff: EffectivePreset, bus_path: str) -> list[str]:
     rt_dir = runtime_dir()
     cmd = [proxy, dbus_bus_address(rt_dir), bus_path]
     # xdg-dbus-proxy 默认是"无过滤透传"模式, 必须显式给出 --filter,
-    # 其后的 --talk/--see/--own 策略才会被强制执行 (支持 "org.foo.*" 通配符)。
+    # 其后的 --talk/--own 策略才会被强制执行 (支持 "org.foo.*" 通配符)。
     cmd.append("--filter")
-    for name in eff.dbus_whitelist:
-        cmd.append(f"--talk={name}")
+    for entry in eff.dbus_whitelist:
+        name, policy = parse_dbus_policy_entry(entry, "dbus_whitelist")
+        flag = "--talk" if policy == "talk" else "--own"
+        cmd.append(f"{flag}={name}")
     return cmd
 
 
@@ -1433,8 +1818,23 @@ def build_bwrap_cmd(
     if seccomp_fd is not None:
         add("--add-seccomp-fd", str(seccomp_fd))
 
-    if not feat("net"):
+    if eff.net == "off":
         add("--unshare-net")
+    elif eff.net == "isolated":
+        # 隔离模式: pasta 在外层创建独立 Network Namespace 并接管流量,
+        # bwrap 绝不能再加 --unshare-net (否则会创建完全断网的空网络命名空间);
+        # 同时必须显式指定 --unshare-user --uid {host_uid} --gid {host_gid},
+        # 解决 pasta 外层 user namespace 映射导致容器内进程退化为 root 的身份倒错问题。
+        add(
+            "--unshare-user",
+            "--uid",
+            str(os.getuid()),
+            "--gid",
+            str(os.getgid()),
+        )
+    elif eff.net == "shared":
+        # 共享宿主网络命名空间, 直通网络 (不加 --unshare-net)
+        pass
 
     add("--unshare-pid")
     add("--unshare-ipc")
@@ -1476,6 +1876,155 @@ def resolve_bwrap(print_mode: bool) -> str:
     if print_mode:
         return "bwrap"
     abort("找不到 bwrap, 请先安装 bubblewrap")
+
+
+def resolve_xwayland_satellite(print_mode: bool = False) -> str:
+    path = shutil.which("xwayland-satellite")
+    if path:
+        return path
+    if print_mode:
+        warn("未找到 xwayland-satellite (启用 x11 特性需要 xwayland-satellite)")
+        return "xwayland-satellite"
+    abort("未找到 xwayland-satellite, 启用 x11 特性需要先安装 xwayland-satellite")
+
+
+def resolve_pasta(print_mode: bool = False) -> str:
+    path = shutil.which("pasta")
+    if path:
+        return path
+    if print_mode:
+        warn("未找到 pasta (启用网络隔离模式 net=\"isolated\" 需要 pasta)")
+        return "pasta"
+    abort(
+        "未找到 pasta, 无法启用网络隔离模式 (net=\"isolated\")。\n"
+        "请先安装 passt 软件包 (如执行: sudo pacman -S passt),\n"
+        "或在配置中指定 net = \"shared\" (共享宿主网络) / net = \"off\" (关闭网络)。"
+    )
+
+
+def resolve_systemd_run(print_mode: bool = False) -> str:
+    path = shutil.which("systemd-run")
+    if path:
+        return path
+    if print_mode:
+        warn("未找到 systemd-run (启用 systemd 作用域管理需要 systemd)")
+        return "systemd-run"
+    abort("未找到 systemd-run 命令, 无法使用 systemd 作用域管理")
+
+
+def sanitize_unit_name(name: str) -> str:
+    """清理预设名以生成符合 systemd unit 命名的合法字符串。"""
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
+    return cleaned.strip("-") or "sandbox"
+
+
+def is_systemd_user_available() -> bool:
+    """探测当前会话中 systemd --user 实例是否正常可用。"""
+    if not shutil.which("systemd-run") or not shutil.which("systemctl"):
+        return False
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not xdg_runtime:
+        return False
+    private_socket = Path(xdg_runtime) / "systemd" / "private"
+    if not private_socket.is_socket():
+        return False
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "Version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+        )
+        return res.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def should_use_systemd(mode: str, print_mode: bool = False) -> bool:
+    """根据模式与运行时环境判断本次启动是否应包裹 systemd-run。"""
+    if mode == "off":
+        return False
+    if mode == "on":
+        if print_mode:
+            return True
+        if not is_systemd_user_available():
+            abort(
+                "配置或参数显式指定了 systemd = 'on', 但当前环境中未检测到运行中的 "
+                "systemd --user 实例 (XDG_RUNTIME_DIR/systemd/private 不可用)"
+            )
+        return True
+    if mode == "auto":
+        return is_systemd_user_available()
+    return False
+
+
+def build_systemd_run_args(
+    eff: EffectivePreset,
+    unit_name: str,
+    desc: str,
+    print_mode: bool = False,
+) -> list[str]:
+    sr_bin = resolve_systemd_run(print_mode=print_mode)
+    args = [
+        sr_bin,
+        "--user",
+        "--scope",
+        "-q",
+        "--collect",
+        "--same-dir",
+        f"--unit={unit_name}",
+        f"--description={desc}",
+    ]
+    slice_name = eff.slice or "app.slice"
+    if not slice_name.endswith(".slice"):
+        slice_name = f"{slice_name}.slice"
+    args.append(f"--slice={slice_name}")
+
+    if eff.memory_max:
+        args.append(f"--property=MemoryMax={eff.memory_max}")
+    if eff.memory_high:
+        args.append(f"--property=MemoryHigh={eff.memory_high}")
+    if eff.cpu_quota:
+        args.append(f"--property=CPUQuota={eff.cpu_quota}")
+    if eff.tasks_max:
+        args.append(f"--property=TasksMax={eff.tasks_max}")
+    if eff.io_weight:
+        args.append(f"--property=IOWeight={eff.io_weight}")
+
+    args.append("--")
+    return args
+
+
+def query_systemd_scope(unit_name: str) -> dict[str, str]:
+    """查询 systemd scope 的当前状态与 cgroup 资源指标。"""
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return {}
+    try:
+        proc = subprocess.run(
+            [
+                systemctl,
+                "--user",
+                "show",
+                unit_name,
+                "-p",
+                "ActiveState,SubState,MainPID,MemoryCurrent,TasksCurrent,CPUUsageNSec",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        result: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                result[k.strip()] = v.strip()
+        return result
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1601,8 +2150,8 @@ def scan_state_dir(state_dir: Path, clean_stale: bool = True) -> list[tuple[Path
     except OSError as exc:
         abort(f"无法读取状态目录 {state_dir}: {exc}")
     for child in children:
-        if child.name == SECCOMP_CACHE_DIRNAME:
-            # seccomp 缓存按设计不做自动清理, ps/stop/kill 必须跳过它
+        if child.name in (SECCOMP_CACHE_DIRNAME, X11_LOCKS_DIRNAME):
+            # seccomp 缓存与 X11 锁目录按设计不做自动清理, ps/stop/kill 必须跳过它
             continue
         if not child.is_dir() or child.is_symlink():
             continue
@@ -1710,11 +2259,20 @@ def terminate_run_entry(info: dict, force: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-def print_banner(settings_label: str, program_label: str, entry: str, project_dir: str) -> None:
-    print(f"=== run-sandbox: {settings_label} -> {entry} ===", file=sys.stderr)
+def print_banner(
+    settings_label: str,
+    program_label: str,
+    entry: str,
+    project_dir: str,
+    net_mode: str = "isolated",
+    systemd_unit: str | None = None,
+) -> None:
+    print(f"=== easy-bwrap: {settings_label} -> {entry} ===", file=sys.stderr)
     if program_label != settings_label:
         print(f"Settings: {settings_label} | Program: {program_label}", file=sys.stderr)
-    print(f"Project: {project_dir}", file=sys.stderr)
+    banner_net = f"Net: {net_mode}"
+    banner_sd = f" | Scope: {systemd_unit}" if systemd_unit else ""
+    print(f"Project: {project_dir} | {banner_net}{banner_sd}", file=sys.stderr)
 
 
 def prepare_vhome_dir(run_dir: Path) -> str:
@@ -1788,12 +2346,13 @@ def seccomp_action_macro(action: str, errno_code: str | None = None) -> str:
     if action == "log":
         return "SCMP_ACT_LOG"
     abort(f"内部错误: 未知 seccomp 动作 '{action}'")
-    raise AssertionError("unreachable")
 
 
 def generate_seccomp_c(profile: SeccompProfile) -> str:
+    has_compat32 = any(rule.action == "compat32" for rule in profile.rules)
+    compat32_c_val = "1" if has_compat32 else "0"
     lines = [
-        "/* 由 run-sandbox 依据 [seccomp] 配置文本自动生成, 请勿手改 */",
+        "/* 由 easy-bwrap 依据 [seccomp] 配置文本自动生成, 请勿手改 */",
         "#include <asm/ioctls.h>",
         "#include <errno.h>",
         "#include <seccomp.h>",
@@ -1838,10 +2397,18 @@ def generate_seccomp_c(profile: SeccompProfile) -> str:
         "static int lock_native_arch(scmp_filter_ctx ctx) {",
         "#if defined(__x86_64__)",
         "  if (seccomp_arch_remove(ctx, SCMP_ARCH_NATIVE) != 0) return -1;",
-        "  return seccomp_arch_add(ctx, SCMP_ARCH_X86_64);",
+        "  if (seccomp_arch_add(ctx, SCMP_ARCH_X86_64) != 0) return -1;",
+        f"  if ({compat32_c_val}) {{",
+        "    (void)seccomp_arch_add(ctx, SCMP_ARCH_X86);",
+        "  }",
+        "  return 0;",
         "#elif defined(__aarch64__)",
         "  if (seccomp_arch_remove(ctx, SCMP_ARCH_NATIVE) != 0) return -1;",
-        "  return seccomp_arch_add(ctx, SCMP_ARCH_AARCH64);",
+        "  if (seccomp_arch_add(ctx, SCMP_ARCH_AARCH64) != 0) return -1;",
+        f"  if ({compat32_c_val}) {{",
+        "    (void)seccomp_arch_add(ctx, SCMP_ARCH_ARM);",
+        "  }",
+        "  return 0;",
         "#else",
         "  return 0;",
         "#endif",
@@ -1862,6 +2429,9 @@ def generate_seccomp_c(profile: SeccompProfile) -> str:
     ]
     lineno = 1
     for rule in profile.rules:
+        if rule.action == "compat32":
+            lineno += 1
+            continue
         if rule.action == "tiocsti":
             lines.append(
                 f"  if (add_tiocsti_rule(ctx, {lineno}) != 0) "
@@ -2041,7 +2611,6 @@ def open_seccomp_fd(bpf_path: str) -> int:
             except OSError:
                 pass
         abort(f"无法打开 seccomp BPF 文件: {bpf_path}")
-        raise AssertionError("unreachable")
 
 
 def run_sandbox(
@@ -2075,6 +2644,8 @@ def run_sandbox(
         "pid_start": None,
         "proxy_pid": None,
         "proxy_start": None,
+        "net_mode": settings.net,
+        "systemd_unit": None,
         "dbus_mode": dbus_mode,
         "dbus_bus": None,
         "vhome": None,
@@ -2093,12 +2664,13 @@ def run_sandbox(
     bwrap_proc: subprocess.Popen | None = None
     seccomp_fd: int | None = None
     seccomp_fd_open = False
+    x11_lock_fd: int | None = None
     try:
         write_run_info(run_dir, info)
 
         x11_display: int | None = None
         if settings.features.get("x11"):
-            x11_display = allocate_x11_display(state_dir)
+            x11_display, x11_lock_fd = allocate_x11_display(state_dir, run_id)
             info["x11_display"] = x11_display
 
         vhome_path: str | None = None
@@ -2118,6 +2690,7 @@ def run_sandbox(
             bus_path = str(bus_dir / "bus")
             info["dbus_bus"] = bus_path
 
+        bpf_path: str | None = None
         if settings.features.get("seccomp", False):
             profile_name = settings.seccomp_profile or "default"
             profile = config.seccomp_profiles.get(profile_name)
@@ -2144,7 +2717,28 @@ def run_sandbox(
             x11_display=x11_display,
         )
         ensure_create_dirs(mkdirs)
-        print_banner(settings_label, program_label, entry, project_dir)
+
+        use_systemd = should_use_systemd(settings.systemd, print_mode=False)
+        systemd_unit: str | None = None
+        if use_systemd:
+            unit_suffix = secrets.token_hex(3)
+            systemd_unit = f"app-easybwrap-{sanitize_unit_name(settings.name)}-{unit_suffix}.scope"
+            info["systemd_unit"] = systemd_unit
+        else:
+            has_resource_limits = any(
+                [settings.memory_max, settings.memory_high, settings.cpu_quota, settings.tasks_max, settings.io_weight]
+            )
+            if has_resource_limits:
+                warn(f"预设 '{settings.name}' 配置了 cgroup 资源限制, 但未启用 systemd 作用域, 限制将不生效")
+
+        print_banner(
+            settings_label,
+            program_label,
+            entry,
+            project_dir,
+            net_mode=settings.net,
+            systemd_unit=systemd_unit,
+        )
 
         if dbus_mode == "proxy":
             assert bus_path is not None
@@ -2154,14 +2748,80 @@ def run_sandbox(
             info["proxy_start"] = process_start_time(proxy_proc.pid)
             write_run_info(run_dir, info)
 
+        launch_argv: list[str]
+        launch_pass_fds: tuple[int, ...]
+        if settings.net == "isolated":
+            pasta_bin = resolve_pasta(print_mode=False)
+            if seccomp_fd is not None:
+                assert bpf_path is not None
+                # pasta 在初始化阶段会调用 close_range 彻底关闭继承的文件描述符,
+                # 故此此处通过内层 bash 重新以只读打开 bpf 文件绑定至 FD 9 后 exec bwrap,
+                # 父进程无需且无法通过 pasta 透传 FD 9。
+                inner_cmd = [
+                    pasta_bin,
+                    "--config-net",
+                    "-q",
+                    "--",
+                    "/usr/bin/bash",
+                    "-c",
+                    'exec 9<"$1"; shift; exec "$@"',
+                    "--",
+                    bpf_path,
+                    bwrap,
+                    *bwrap_args,
+                ]
+                launch_pass_fds = ()
+            else:
+                inner_cmd = [
+                    pasta_bin,
+                    "--config-net",
+                    "-q",
+                    "--",
+                    bwrap,
+                    *bwrap_args,
+                ]
+                launch_pass_fds = ()
+        else:
+            if use_systemd and seccomp_fd is not None:
+                assert bpf_path is not None
+                inner_cmd = [
+                    "/usr/bin/bash",
+                    "-c",
+                    'exec 9<"$1"; shift; exec "$@"',
+                    "--",
+                    bpf_path,
+                    bwrap,
+                    *bwrap_args,
+                ]
+                launch_pass_fds = ()
+            else:
+                inner_cmd = [bwrap, *bwrap_args]
+                launch_pass_fds = (SECCOMP_FD,) if seccomp_fd is not None else ()
+
+        if use_systemd:
+            assert systemd_unit is not None
+            sd_args = build_systemd_run_args(
+                settings,
+                unit_name=systemd_unit,
+                desc=f"EasyBwrap sandbox for {settings.name} ({run_id})",
+                print_mode=False,
+            )
+            launch_argv = [*sd_args, *inner_cmd]
+        else:
+            launch_argv = inner_cmd
+
         try:
             bwrap_proc = subprocess.Popen(
-                [bwrap, *bwrap_args],
-                start_new_session=True,
-                pass_fds=(SECCOMP_FD,) if seccomp_fd is not None else (),
+                launch_argv,
+                pass_fds=launch_pass_fds,
             )
         except OSError as exc:
-            abort(f"无法启动 bwrap: {exc}")
+            launcher_name = (
+                "systemd-run"
+                if use_systemd
+                else ("pasta" if settings.net == "isolated" else "bwrap")
+            )
+            abort(f"无法启动 {launcher_name}: {exc}")
         if seccomp_fd_open:
             try:
                 os.close(SECCOMP_FD)
@@ -2177,19 +2837,66 @@ def run_sandbox(
             }
         )
         write_run_info(run_dir, info)
-        return normalize_rc(bwrap_proc.wait())
+
+        old_sigint = signal.getsignal(signal.SIGINT)
+        old_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def _forward_signal(signum: int, _frame: Any) -> None:
+            if bwrap_proc is not None and bwrap_proc.poll() is None:
+                try:
+                    bwrap_proc.send_signal(signum)
+                except OSError:
+                    pass
+
+        try:
+            signal.signal(signal.SIGINT, _forward_signal)
+            signal.signal(signal.SIGTERM, _forward_signal)
+            rc = bwrap_proc.wait()
+        finally:
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGTERM, old_sigterm)
+
+        return normalize_rc(rc)
     finally:
+        if x11_lock_fd is not None:
+            try:
+                fcntl.flock(x11_lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(x11_lock_fd)
+            except OSError:
+                pass
         if seccomp_fd_open:
             try:
                 os.close(SECCOMP_FD)
             except OSError:
                 pass
         if bwrap_proc is not None and bwrap_proc.poll() is None:
-            bwrap_proc.kill()
+            if systemd_unit and shutil.which("systemctl"):
+                subprocess.run(
+                    ["systemctl", "--user", "stop", systemd_unit],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             try:
+                bwrap_proc.terminate()
                 bwrap_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+            except (OSError, subprocess.TimeoutExpired):
+                if bwrap_proc.poll() is None:
+                    if systemd_unit and shutil.which("systemctl"):
+                        subprocess.run(
+                            ["systemctl", "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", systemd_unit],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    bwrap_proc.kill()
+                    try:
+                        bwrap_proc.wait(timeout=2)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
         stop_subprocess(proxy_proc)
         shutil.rmtree(run_dir, ignore_errors=True)
 
@@ -2206,43 +2913,43 @@ def print_plan(
     bwrap = resolve_bwrap(print_mode=True)
 
     lines: list[str] = []
-    lines.append("RUN_SANDBOX_STATE_DIR=" + shlex.quote(config.general.state_dir))
-    lines.append('mkdir -p -- "$RUN_SANDBOX_STATE_DIR"')
+    lines.append("EASY_BWRAP_STATE_DIR=" + shlex.quote(config.general.state_dir))
+    lines.append('mkdir -p -- "$EASY_BWRAP_STATE_DIR"')
     lines.append(
-        'RUN_SANDBOX_RUN_DIR="$(mktemp -d -p "$RUN_SANDBOX_STATE_DIR" '
+        'EASY_BWRAP_RUN_DIR="$(mktemp -d -p "$EASY_BWRAP_STATE_DIR" '
         + shlex.quote(f"{safe_run_prefix(settings_label)}.XXXXXX")
         + ')"'
     )
-    lines.append('RUN_SANDBOX_PROXY_PID=""')
+    lines.append('EASY_BWRAP_PROXY_PID=""')
     lines.append(
-        '_run_sandbox_cleanup() { if [ -n "$RUN_SANDBOX_PROXY_PID" ]; then '
-        'kill "$RUN_SANDBOX_PROXY_PID" 2>/dev/null || true; fi; '
-        'rm -rf "$RUN_SANDBOX_RUN_DIR"; }'
+        '_easy_bwrap_cleanup() { if [ -n "$EASY_BWRAP_PROXY_PID" ]; then '
+        'kill "$EASY_BWRAP_PROXY_PID" 2>/dev/null || true; fi; '
+        'rm -rf "$EASY_BWRAP_RUN_DIR"; }'
     )
-    lines.append("trap _run_sandbox_cleanup EXIT")
+    lines.append("trap _easy_bwrap_cleanup EXIT")
 
     vhome_path: str | None = None
     if settings.features.get("vhome"):
         vhome_path = VHOME_DIR_ARG
         lines.append(
-            'mkdir -p -- "$RUN_SANDBOX_RUN_DIR/vhome/.config" '
-            '"$RUN_SANDBOX_RUN_DIR/vhome/.cache"'
+            'mkdir -p -- "$EASY_BWRAP_RUN_DIR/vhome/.config" '
+            '"$EASY_BWRAP_RUN_DIR/vhome/.cache"'
         )
 
     bus_path: str | None = None
     if dbus_mode == "proxy":
         bus_path = DBUS_BUS_ARG
-        lines.append('mkdir -p -- "$RUN_SANDBOX_RUN_DIR/dbus"')
+        lines.append('mkdir -p -- "$EASY_BWRAP_RUN_DIR/dbus"')
         lines.append(shell_join_argv(build_proxy_cmd(settings, DBUS_BUS_ARG)) + " &")
-        lines.append("RUN_SANDBOX_PROXY_PID=$!")
+        lines.append("EASY_BWRAP_PROXY_PID=$!")
         lines.append(
-            '_run_sandbox_i=0; while [ "$_run_sandbox_i" -lt 50 ] && '
-            '[ ! -S "$RUN_SANDBOX_RUN_DIR/dbus/bus" ]; do sleep 0.05; '
-            '_run_sandbox_i=$((_run_sandbox_i+1)); done'
+            '_easy_bwrap_i=0; while [ "$_easy_bwrap_i" -lt 50 ] && '
+            '[ ! -S "$EASY_BWRAP_RUN_DIR/dbus/bus" ]; do sleep 0.05; '
+            '_easy_bwrap_i=$((_easy_bwrap_i+1)); done'
         )
         lines.append(
-            'if [ ! -S "$RUN_SANDBOX_RUN_DIR/dbus/bus" ] || '
-            '! kill -0 "$RUN_SANDBOX_PROXY_PID" 2>/dev/null; then '
+            'if [ ! -S "$EASY_BWRAP_RUN_DIR/dbus/bus" ] || '
+            '! kill -0 "$EASY_BWRAP_PROXY_PID" 2>/dev/null; then '
             'echo "xdg-dbus-proxy 启动失败或提前退出" >&2; exit 1; fi'
         )
         if not settings.dbus_whitelist:
@@ -2250,7 +2957,8 @@ def print_plan(
 
     x11_display: int | None = None
     if settings.features.get("x11"):
-        x11_display = choose_x11_display()
+        state_dir_path = Path(config.general.state_dir)
+        x11_display = choose_x11_display(state_dir_path if state_dir_path.is_dir() else None)
 
     seccomp_fd: int | None = None
     if settings.features.get("seccomp", False):
@@ -2262,48 +2970,49 @@ def print_plan(
         cc = resolve_cc(print_mode=True)
         key = seccomp_cache_key(profile.filter_text)
         lines.append(
-            'RUN_SANDBOX_SECCOMP_CACHE="$RUN_SANDBOX_STATE_DIR/'
+            'EASY_BWRAP_SECCOMP_CACHE="$EASY_BWRAP_STATE_DIR/'
             f'{SECCOMP_CACHE_DIRNAME}"'
         )
-        lines.append("RUN_SANDBOX_SECCOMP_KEY=" + shlex.quote(key))
+        lines.append("EASY_BWRAP_SECCOMP_KEY=" + shlex.quote(key))
         lines.append(
-            'RUN_SANDBOX_SECCOMP_BPF="$RUN_SANDBOX_SECCOMP_CACHE/'
-            'seccomp-$RUN_SANDBOX_SECCOMP_KEY.bpf"'
+            'EASY_BWRAP_SECCOMP_BPF="$EASY_BWRAP_SECCOMP_CACHE/'
+            'seccomp-$EASY_BWRAP_SECCOMP_KEY.bpf"'
         )
         lines.append(
-            'mkdir -p -- "$RUN_SANDBOX_SECCOMP_CACHE" '
-            '"$RUN_SANDBOX_RUN_DIR/seccomp"'
+            'mkdir -p -- "$EASY_BWRAP_SECCOMP_CACHE" '
+            '"$EASY_BWRAP_RUN_DIR/seccomp"'
         )
-        lines.append('if [ ! -s "$RUN_SANDBOX_SECCOMP_BPF" ]; then')
+        lines.append('if [ ! -s "$EASY_BWRAP_SECCOMP_BPF" ]; then')
         lines.append(
-            "  cat > \"$RUN_SANDBOX_RUN_DIR/seccomp/filter.c\" "
-            "<<'RUN_SANDBOX_SECCOMP_EOF'"
+            "  cat > \"$EASY_BWRAP_RUN_DIR/seccomp/filter.c\" "
+            "<<'EASY_BWRAP_SECCOMP_EOF'"
         )
         lines.extend("  " + line for line in generate_seccomp_c(profile).rstrip().splitlines())
-        lines.append("RUN_SANDBOX_SECCOMP_EOF")
+        lines.append("EASY_BWRAP_SECCOMP_EOF")
         lines.append(
             "  " + shlex.quote(cc)
-            + ' -O2 -Wall -o "$RUN_SANDBOX_RUN_DIR/seccomp/filter-gen" '
-            '"$RUN_SANDBOX_RUN_DIR/seccomp/filter.c" -lseccomp'
+            + ' -O2 -Wall -o "$EASY_BWRAP_RUN_DIR/seccomp/filter-gen" '
+            '"$EASY_BWRAP_RUN_DIR/seccomp/filter.c" -lseccomp'
         )
         lines.append(
-            '  "$RUN_SANDBOX_RUN_DIR/seccomp/filter-gen" '
-            '> "$RUN_SANDBOX_RUN_DIR/seccomp/filter.bpf"'
+            '  "$EASY_BWRAP_RUN_DIR/seccomp/filter-gen" '
+            '> "$EASY_BWRAP_RUN_DIR/seccomp/filter.bpf"'
         )
         lines.append(
-            '  cp -- "$RUN_SANDBOX_RUN_DIR/seccomp/filter.bpf" '
-            '"$RUN_SANDBOX_SECCOMP_BPF.tmp.$$"'
+            '  cp -- "$EASY_BWRAP_RUN_DIR/seccomp/filter.bpf" '
+            '"$EASY_BWRAP_SECCOMP_BPF.tmp.$$"'
         )
         lines.append(
-            '  mv -- "$RUN_SANDBOX_SECCOMP_BPF.tmp.$$" '
-            '"$RUN_SANDBOX_SECCOMP_BPF"'
+            '  mv -- "$EASY_BWRAP_SECCOMP_BPF.tmp.$$" '
+            '"$EASY_BWRAP_SECCOMP_BPF"'
         )
         lines.append("fi")
         lines.append(
-            'cp -- "$RUN_SANDBOX_SECCOMP_BPF" '
-            '"$RUN_SANDBOX_RUN_DIR/seccomp/filter.bpf"'
+            'cp -- "$EASY_BWRAP_SECCOMP_BPF" '
+            '"$EASY_BWRAP_RUN_DIR/seccomp/filter.bpf"'
         )
-        lines.append('exec 9<"$RUN_SANDBOX_SECCOMP_BPF"')
+        if not should_use_systemd(settings.systemd, print_mode=True) and settings.net != "isolated":
+            lines.append('exec 9<"$EASY_BWRAP_SECCOMP_BPF"')
 
     mkdirs, bwrap_args = build_bwrap_cmd(
         settings,
@@ -2319,7 +3028,70 @@ def print_plan(
 
     for directory in mkdirs:
         lines.append("mkdir -p -- " + shlex.quote(directory))
-    lines.append(shell_join_argv([bwrap, *bwrap_args]))
+
+    use_systemd = should_use_systemd(settings.systemd, print_mode=True)
+    systemd_unit: str | None = None
+    if use_systemd:
+        systemd_unit = f"app-easybwrap-{sanitize_unit_name(settings.name)}-$$.scope"
+    else:
+        has_resource_limits = any(
+            [settings.memory_max, settings.memory_high, settings.cpu_quota, settings.tasks_max, settings.io_weight]
+        )
+        if has_resource_limits:
+            warn(f"预设 '{settings.name}' 配置了 cgroup 资源限制, 但未启用 systemd 作用域, 限制将不生效")
+
+    if settings.net == "isolated":
+        pasta_bin = resolve_pasta(print_mode=True)
+        if seccomp_fd is not None:
+            inner_cmd = [
+                pasta_bin,
+                "--config-net",
+                "-q",
+                "--",
+                "/usr/bin/bash",
+                "-c",
+                'exec 9<"$1"; shift; exec "$@"',
+                "--",
+                _ShellRef('"$EASY_BWRAP_SECCOMP_BPF"'),
+                bwrap,
+                *bwrap_args,
+            ]
+        else:
+            inner_cmd = [
+                pasta_bin,
+                "--config-net",
+                "-q",
+                "--",
+                bwrap,
+                *bwrap_args,
+            ]
+    else:
+        if use_systemd and seccomp_fd is not None:
+            inner_cmd = [
+                "/usr/bin/bash",
+                "-c",
+                'exec 9<"$1"; shift; exec "$@"',
+                "--",
+                _ShellRef('"$EASY_BWRAP_SECCOMP_BPF"'),
+                bwrap,
+                *bwrap_args,
+            ]
+        else:
+            inner_cmd = [bwrap, *bwrap_args]
+
+    if use_systemd:
+        assert systemd_unit is not None
+        sd_args = build_systemd_run_args(
+            settings,
+            unit_name=systemd_unit,
+            desc=f"EasyBwrap sandbox for {settings.name}",
+            print_mode=True,
+        )
+        launch_argv = [*sd_args, *inner_cmd]
+    else:
+        launch_argv = inner_cmd
+
+    lines.append(shell_join_argv(launch_argv))
     print("\n".join(lines))
     return 0
 
@@ -2349,6 +3121,8 @@ def do_ps(config: Config, json_mode: bool = False) -> int:
     if json_mode:
         rows = []
         for run_dir, info in entries:
+            unit = info.get("systemd_unit")
+            sd_props = query_systemd_scope(unit) if unit else {}
             rows.append(
                 {
                     "run_id": info.get("run_id") or run_dir.name,
@@ -2359,6 +3133,11 @@ def do_ps(config: Config, json_mode: bool = False) -> int:
                     "pid": info.get("pid"),
                     "proxy_pid": info.get("proxy_pid"),
                     "launcher_pid": info.get("launcher_pid"),
+                    "net_mode": info.get("net_mode"),
+                    "systemd_unit": unit,
+                    "systemd_active": sd_props.get("ActiveState"),
+                    "memory_bytes": sd_props.get("MemoryCurrent"),
+                    "tasks_count": sd_props.get("TasksCurrent"),
                     "dbus_mode": info.get("dbus_mode"),
                     "dbus_bus": info.get("dbus_bus"),
                     "vhome": info.get("vhome"),
@@ -2378,16 +3157,17 @@ def do_ps(config: Config, json_mode: bool = False) -> int:
         print("没有正在运行的任务。")
         return 0
     print(
-        f"{'RUN ID':<26} {'PRESET':<16} {'STATE':<9} {'PID':>7} {'AGE':>8}  PROGRAM"
+        f"{'RUN ID':<24} {'PRESET':<14} {'NET':<9} {'STATE':<8} {'PID':>7} {'AGE':>8}  PROGRAM"
     )
     for run_dir, info in entries:
         run_id = str(info.get("run_id") or run_dir.name)
         preset = str(info.get("preset") or "?")
+        net_mode = str(info.get("net_mode") or "-")
         state = str(info.get("state") or "?")
         pid = info.get("pid") or "-"
         age = format_age(now - float(info.get("created_at") or now))
         program = str(info.get("program") or "")
-        print(f"{run_id:<26} {preset:<16} {state:<9} {pid:>7} {age:>8}  {program}")
+        print(f"{run_id:<24} {preset:<14} {net_mode:<9} {state:<8} {pid:>7} {age:>8}  {program}")
     return 0
 
 
@@ -2398,6 +3178,8 @@ def do_control(config: Config, ref: str, force: bool) -> int:
     main_pid = info.get("pid") or info.get("launcher_pid")
     proxy_pid = info.get("proxy_pid")
     launcher_pid = info.get("launcher_pid")
+    unit = info.get("systemd_unit")
+    systemctl = shutil.which("systemctl")
 
     if not run_info_alive(info):
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -2405,12 +3187,44 @@ def do_control(config: Config, ref: str, force: bool) -> int:
         return 0
 
     if force:
+        if unit and systemctl:
+            print(f"强制停止 systemd 作用域 {unit} (SIGKILL)...")
+            subprocess.run(
+                [systemctl, "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if _wait_run_dir_gone(run_dir, 2.0):
+                print(f"已停止并清理: {run_id}")
+                return 0
         print(f"强制停止 {run_id} (SIGKILL -> {main_pid or '-'})")
         terminate_run_entry(info, force=True)
         if _wait_run_dir_gone(run_dir, 2.0):
             print(f"已停止并清理: {run_id}")
             return 0
     else:
+        if unit and systemctl:
+            print(f"停止 systemd 作用域 {unit}...")
+            subprocess.run(
+                [systemctl, "--user", "stop", unit],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if _wait_run_dir_gone(run_dir, 4.0):
+                print(f"已停止并清理: {run_id}")
+                return 0
+            print("systemd stop 未能在 4s 内结束任务, 升级为 SIGKILL...")
+            subprocess.run(
+                [systemctl, "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if _wait_run_dir_gone(run_dir, 2.0):
+                print(f"已停止并清理: {run_id}")
+                return 0
         print(f"中断 {run_id} (SIGINT -> {main_pid or '-'})")
         terminate_run_entry(info, force=False)
         if _wait_run_dir_gone(run_dir, 4.0):
@@ -2453,7 +3267,7 @@ def dispatch_control(opts: CliOptions, config: Config) -> int:
         abort("ps 仅支持可选参数 --json")
     if command in ("stop", "kill"):
         if len(opts.app_args) != 1 or not opts.app_args[0].strip():
-            abort(f"{command} 需要一个非空运行 ID (来自 run-sandbox ps)")
+            abort(f"{command} 需要一个非空运行 ID (来自 easy-bwrap ps)")
         return do_control(config, opts.app_args[0], force=(command == "kill"))
     abort(f"未知控制命令 '{command}'")
 
@@ -2488,6 +3302,14 @@ def dispatch(opts: CliOptions, config: Config, conf_path: Path) -> int:
                 f"seccomp 指定了不存在的过滤配置 '{profile_name}' "
                 f"(可用: {avail})"
             )
+
+    if settings.features.get("x11", False):
+        if not settings.features.get("wayland", False):
+            abort(
+                f"预设 '{settings_name}' 启用了 x11, 但未启用 wayland 特性。"
+                "xwayland-satellite 需要 Wayland 会话支持，请同时启用 wayland 特性 (wayland = true)。"
+            )
+        resolve_xwayland_satellite(print_mode=opts.print_mode)
 
     if not os.path.exists(entry):
         abort(f"入口不存在: {entry}")

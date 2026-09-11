@@ -1,220 +1,248 @@
-# ============================================================
-# run-sandbox.toml — run-sandbox 配置文件
+# ==============================================================================
+# EasyBwrap 配置文件模板 (easy-bwrap.toml)
 #
-# 风格约定:
-#   * 布尔一律使用 TOML 的 true / false
-#   * dbus 是唯一的三态枚举: "off" | "proxy" | "direct"
-#   * bind 首选紧凑字符串写法 "src[:dst][:mode]";
-#     只有路径本身含冒号时才需要表写法
-#   * 未列出的特性/绑定/程序一律不生效
-#     (唯一例外: seccomp 特性默认 true, 可在 [features] 或预设中关闭)
+# 配置加载逻辑:
+#   1. 环境变量 EASY_BWRAP_CONF 指定的路径
+#   2. 脚本所在目录下的 easy-bwrap.toml
+#   3. 脚本所在目录下的 run-sandbox.toml
 #
-# 配置优先级 (低 -> 高):
-#   [features] / [general] 全局默认
-#   < extends 引用的预设
-#   < 当前预设自身配置
-#   < 命令行 --override
-#
-# 状态目录: [general] state_dir (仅此一个路径, 建议放在 /tmp)
-#   每个运行任务占用一个 <预设名>.<随机串>/ 子目录:
-#     info.json  运行记录 (run-sandbox ps/stop/kill 使用)
-#     dbus/      dbus=proxy 时的代理 socket (可选)
-#     vhome/     vhome=true 时创建的虚拟家目录 (可选)
-#   程序退出或被 stop/kill 后, 该子目录会被主动清理。
-# ============================================================
+# 配置继承与覆盖优先级 (由低到高):
+#   [defaults] 全局默认 < extends 继承预设 < [presets.*] 当前预设 < --override 命令行覆盖
+# ==============================================================================
 
+# ------------------------------------------------------------------------------
+# 全局常规选项
+# ------------------------------------------------------------------------------
 [general]
-default = "zsh"     # 新 zsh = 旧 zsh-sec（精简安全）；如需旧默认行为改成 "zsh-full"
-editor = "nvim"
+# 未指定程序/预设时的默认启动预设名称
+default = "shell"
+
+# 默认编辑器 (用于打开或查看配置文件)
+editor = "nano"
+
+# 安全检查开关 (防止将系统关键目录或裸家目录误挂载入沙箱)
 security = true
-state_dir = "/tmp/run-sandbox-state"   # 状态根目录：每任务 <preset>.<随机串>/ 子目录
-# 安全黑名单: "路径" 树匹配(含子树); "路径:exact" 仅精确; ~ = $HOME
-blocklist = ["/", "/etc", "/usr", "/opt", "/sys", "/dev", "/run", "/proc", "~:exact", "~/.ssh"]
-# 其他常用敏感路径参考: "~/.gnupg" "~/.aws" "~/.config" "~/.local" "~/.cache"
-#                      "~/.password-store" "~/.netrc" "~/.git-credentials"
-dbus = "off"        # off: 不开放 | proxy: 过滤代理 | direct: 直接绑定宿主总线
-# dbus=proxy 时生效: 允许沙箱内应用访问的 D-Bus 名称 (xdg-dbus-proxy 白名单)。
-#   * 支持 "前缀.*" 通配符; 名称须与总线上实际使用的 well-known 名一致
-#     (服务激活名可查 /usr/share/dbus-1/services/*.service 的 Name= 字段)。
-#   * proxy = 默认拒绝 + 显式允许: 未列入的名称一律不可见/不可达, 激活也被拦截。
-#   * extends 引用预设时, 若不希望继承这里的列表, 在自身预设内整体重写
-#     (dbus_whitelist 是"整体替换"语义, 不与引用预设/全局合并)。
-#   * 仅供本机本地服务共享, 不按"沙箱外可远程触达"场景取舍。
-# 以下为常用且安全的本机桌面/输入法服务(按需增删):
-dbus_whitelist = [
-  "org.freedesktop.portal.*",   # xdg-desktop-portal 门户(截图/文件选择/剪贴板等, 按需)
-  "org.fcitx.Fcitx5",           # fcitx5 输入法
+
+# 沙箱运行态基准目录 (存放临时 socket、虚拟家目录、代理进程 PID 等)
+state_dir = "/tmp/easy-bwrap-state"
+
+# systemd-run 瞬态作用域集成模式:
+#   "auto" : 自动探测是否处于 systemd 会话中，支持则接入，否则平滑降级
+#   "on"   : 强制启用 (若探测失败则报错终止)
+#   "off"  : 显式禁用 systemd 集成
+systemd = "auto"
+
+# systemd 用户 slice 组名 (将沙箱进程归类到指定的 slice 单元下)
+slice = "app.slice"
+
+# 挂载黑名单: 命中以下规则的宿主目录严禁挂载为读写 (加 ':exact' 表示仅精确匹配本身，子目录不受限)
+blocklist = [
+  "/",
+  "/etc",
+  "/usr",
+  "/opt",
+  "/sys",
+  "/dev",
+  "/run",
+  "/proc",
+  "~:exact",
+  "~/.ssh",
 ]
 
-# ---------- 特性全局默认 (各预设可覆盖) ----------
-[features]
-base     = true   # /usr /etc /sys /opt 只读挂载 + /bin /sbin /lib /lib64 + /proc /dev
-gpu.nv   = true   # NVIDIA 设备直通
-gpu.dri  = true   # /dev/dri 直通
-tmpfs    = true   # /tmp /run 使用内存文件系统
-shm      = false  # /dev/shm 使用内存文件系统
-pwd      = false  # 绑定当前工作目录 (需要访问项目的预设再打开)
-net      = true   # false 时 --unshare-net
-vtty     = false  # true 时 --new-session (独立终端会话; 免疫 TIOCSTI, 但部分 TUI 可能显示异常)
-wayland  = false  # Wayland 会话共享
-pipewire = false  # Pipewire 音频通道
-x11      = false  # X11 + xwayland 包装 (display 号 200..999 动态分配)
-vhome    = false  # 虚拟化 $HOME (在状态目录新建目录并 rw 绑定到 $HOME)
-seccomp  = true   # 系统调用过滤 (默认开启; 按预设或 --override 可关闭)
+# 全局 D-Bus 代理模式:
+#   "off"    : 默认隔离 D-Bus，不暴露宿主总线
+#   "proxy"  : 通过 xdg-dbus-proxy 进行精细过滤直通
+#   "direct" : 直接暴露宿主 session bus (不安全，仅用于特殊兼容场景)
+dbus = "off"
 
-# ============================================================
-# 预设: [preset.<名称>]
-#   program = "绝对路径"   程序入口 (继承 extends 时可省略)
-#   alias   = "缩写"       入口别名, 写在 program 下一行
-#                          (可作程序名或 --as 的配置来源; 不被 extends 继承, 可省略)
-#   extends = "预设名"      引用某一已有预设作为基础配置
-#   特性 = true|false       覆盖该预设的特性
-#   dbus / dbus_whitelist  覆盖全局默认
-#   setenv = { K = "V" }   环境变量 (与 extends 按键合并)
-#   bind   = [...]         绑定列表 (自身给出时整体替换 extends 的 bind)
-#   seccomp = true|false|"配置名"   系统调用过滤: true 用 default, 字符串选 [seccomp] 其他档
-#
-# bind 推荐写法:
-#   "src"              等价 "src:src:rw" (默认 rw, 缺失由 bwrap 报错)
-#   "src:ro"           只读            "src:create"  先 mkdir -p 再绑定
-#   "src:rw-try"       缺失跳过        "src:ro-try"  只读且缺失跳过
-#   "src:dst"          绑定到不同路径 (rw)
-#   "src:dst:mode"     不同路径 + 模式
-# 路径含冒号时用表写法: { src = "a:b", dst = "c:d", mode = "ro" }
-# ============================================================
+# 全局 D-Bus 白名单规则 (当 dbus = "proxy" 时生效)
+# 格式: "接口名[:策略]"，策略可选 talk (默认) | own | see
+dbus_whitelist = [
+  "org.freedesktop.portal.*:talk",
+  "org.fcitx.Fcitx5:talk",
+]
 
-[preset.zsh]
-program = "/usr/bin/zsh"
-dbus    = "off"
-gpu.nv  = false
-gpu.dri = false
+# ------------------------------------------------------------------------------
+# 全局默认特性开关 [defaults]
+# 所有预设均以此为基础基线，各预设可单独覆盖指定开关
+# ------------------------------------------------------------------------------
+[defaults]
+# 系统只读基础挂载 (/usr, /etc, /sys, /proc 等系统关键目录)
+base = true
+
+# 图形驱动设备节点直通 (/dev/dri/card*, /dev/dri/renderD*)
+gpu_dri = true
+
+# NVIDIA 专有驱动设备节点直通 (/dev/nvidia*)
+gpu_nv = false
+
+# 独立内存临时文件系统 (为 /tmp 和 /run 分配隔离的 tmpfs)
+tmpfs = true
+
+# 共享内存 (/dev/shm 挂载，大型图形/浏览器程序按需开启)
+shm = false
+
+# 工作目录绑定 (将宿主当前工作目录绑定至沙箱内相同路径)
+pwd = false
+
+# 网络隔离模式:
+#   "isolated" : (推荐) 基于 pasta 的独立用户态网络，彻底防御 X11 抽象套接字逃逸
+#   "shared"   : 共享宿主网络命名空间
+#   "off"      : 完全断开网络连接 (禁用网络命名空间或回环)
+net = "isolated"
+
+# 终端会话伪终端隔离 (彻底免疫沙箱内 TIOCSTI 字符注入逃逸)
+vtty = false
+
+# Wayland 图形显示服务直通
 wayland = false
+
+# PipeWire 音频服务直通
 pipewire = false
-x11     = false
-shm     = false
-pwd     = true
-vhome   = true
+
+# 独立 X11 隔离会话 (在 Wayland 环境下自动启动 xwayland-satellite，分配独立 display)
+# 注意: 启用 x11 必须同时启用 wayland (wayland = true)
+x11 = false
+
+# 虚拟独立家目录 (在沙箱临时状态目录下自动创建并绑定到用户 $HOME，隔离宿主家目录文件)
+vhome = false
+
+# Seccomp 系统调用过滤 (启用后默认加载 [seccomp.default] 规则并即时编译为 BPF)
+seccomp = true
+
+# ------------------------------------------------------------------------------
+# 预设定义: [presets.<预设名称>]
+#
+# 配置项速查:
+#   program          = "程序路径"         # 必填(或继承): 可执行文件绝对路径 (支持 ~ 展开)
+#   alias            = "别名"             # 选填: 快捷调用别名 (不被 extends 继承)
+#   extends          = "父预设名称"       # 选填: 继承基础预设的属性
+#   net              = "isolated"|"shared"|"off"
+#   dbus             = "off"|"proxy"|"direct"
+#   dbus_whitelist   = ["名称[:策略]"]   # 接口策略: :talk (默认) | :own | :see
+#   seccomp          = true|false|"规则名" # 指定引用的 [seccomp] 规则集
+#   systemd          = "auto"|"on"|"off" # 覆盖 systemd 集成行为
+#   memory_max       = "4G"              # Cgroup v2 内存硬限制
+#   memory_high      = "3G"              # Cgroup v2 内存节流水位线
+#   cpu_quota        = "200%"            # Cgroup v2 CPU 配额 (200% 表示最多使用 2 核)
+#   tasks_max        = 500               # Cgroup v2 进程/线程数上限
+#   io_weight        = 100               # Cgroup v2 IO 权重 (1..10000)
+#   setenv           = { K = "V" }       # 环境变量注入
+#   bind             = [                 # 文件系统挂载规则列表
+#     "src[:dst][:mode]"                 # mode 可选: rw(默认) | ro | create | rw-try | ro-try
+#   ]
+# ------------------------------------------------------------------------------
+
+# 1. 基础命令行交互终端 (隔离环境，安全探索或编译运行)
+[presets.shell]
+program = "/usr/bin/bash"
+alias = "sh"
+pwd = true                               # 绑定宿主当前执行目录
+vhome = true                             # 启用虚拟家目录，不污染宿主 ~
 setenv = { BWRAP_SANDBOX = "1" }
 bind = [
-  "~/.zshrc:ro",
-  "~/.config/fontconfig:ro-try",
-  "~/.config/gtk-3.0:ro-try",
+  "~/.bashrc:ro-try",
+  "~/.inputrc:ro-try",
 ]
 
-[preset.zsh-full]
-extends = "zsh"
-# program 继承自 zsh
-dbus    = "proxy"
-gpu.nv  = true
-gpu.dri = true
+# 2. Zsh 终端 (继承自 shell)
+[presets.zsh]
+extends = "shell"
+program = "/usr/bin/zsh"
+bind = [
+  "~/.zshrc:ro-try",
+  "~/.config/fontconfig:ro-try",
+]
+
+# 3. 开发编译沙箱 (挂载常用开发缓存与 git 配置)
+[presets.dev]
+extends = "shell"
+pwd = true
+bind = [
+  "~/.gitconfig:ro-try",
+  "~/.cache:rw-try",
+  "~/.cargo:rw-try",
+]
+setenv = { CARGO_HOME = "~/.cargo" }
+
+# 4. 现代桌面 GUI 应用模板 (以 Firefox 为例)
+[presets.browser]
+program = "/usr/bin/firefox"
+alias = "web"
+wayland = true                           # 直通 Wayland 显示协议
+pipewire = true                          # 直通 PipeWire 声音通道
+gpu_dri = true                           # 直通 DRI 硬件加速
+shm = true                               # 开启 /dev/shm 内存共享
+dbus = "proxy"                           # 启用 D-Bus 代理过滤
+dbus_whitelist = [
+  "org.freedesktop.portal.*:talk",       # 桌面门户 (文件选择、弹窗等)
+  "org.fcitx.Fcitx5:talk",               # 输入法框架
+]
+seccomp = "browser"                      # 浏览器专用 Seccomp 规则 (放行 user namespace)
+memory_max = "4G"                        # 内存硬限制 4GB
+cpu_quota = "200%"                       # 最多占用 2 颗 CPU 核心
+bind = [
+  "~/.mozilla:create",
+  "~/Downloads:rw-try",
+]
+
+# 5. 多媒体播放器模板 (以 mpv 为例，演示 MPRIS 控制直通)
+[presets.media-player]
+program = "/usr/bin/mpv"
 wayland = true
 pipewire = true
-x11     = true
-shm     = true
-seccomp = "browser"
-
-# ---------- 应用预设示例 ----------
-[preset.opencode]
-program = "/usr/bin/opencode"
-alias   = "oc"
-pwd = true
-seccomp = "browser"
-bind = [
-  "~/.config/opencode:create",
-  "~/.local/share/opencode:create",
-  "~/.local/state/opencode",
-  "~/.cache/opencode",
-  "~/.bun",
-  "~/.cc-switch:ro",
-  "~/.cache/uv:rw-try",
-]
-
-[preset.splayer]
-program = "/opt/SPlayer-Next/SPlayer-Next"
+gpu_dri = true
 dbus = "proxy"
-wayland  = true
-pipewire = true
-tmpfs    = false
-seccomp = "browser"
+dbus_whitelist = [
+  "org.mpris.MediaPlayer2.*:own",        # 允许播放器注册 MPRIS 媒体控制接口
+  "org.freedesktop.portal.*:talk",
+]
 bind = [
-  "/mnt/Exten/Cache/Splayer-Next:rw",
-  "~/.config/SPlayer-Next:rw",
-  "/tmp:rw",
+  "~/Videos:ro-try",
+  "~/Music:ro-try",
 ]
 
-[preset.antigravity]
-program = "~/.local/opt/antigravity-cli/antigravity"
-alias   = "agr"
-dbus = "proxy"
-pwd = true
+# 6. 游戏与兼容运行环境 (X11 隔离 + 32 位兼容支持)
+[presets.game-compat]
+program = "/usr/bin/steam"
+wayland = true
+x11 = true                               # 开启隔离 X11 支持
+shm = true                               # 共享内存
+gpu_dri = true
+gpu_nv = true                            # 若为 NVIDIA 显卡直通相关设备
+net = "shared"                           # 游戏网络低延迟共享
+seccomp = "gaming"                       # 放行 32 位兼容调用架构 (compat32)
 bind = [
-  "~/.local/opt/antigravity-cli/home:~:rw",
-  "~/.local/opt/antigravity-cli/antigravity:ro",
+  "~/.local/share/Steam:create",
 ]
 
-[preset.deepseek-harness]
-program = "~/.local/opt/deepseek-harness/entry.sh"
-alias   = "dsh"
-dbus = "proxy"
-seccomp = "harness"
-setenv = { DSH_DIR = "~/.local/opt/deepseek-harness" }
-bind = [
-  "~/.local/opt/deepseek-harness/home:~",  # vitrul home
-  "~/.local/opt/deepseek-harness",         # dsh
-  "~/.local/share/pnpm/store:rw-try",      # pnpm store
-  "~/.local/share/pnpm:rw-try",            # pnpm cache
-  "~/.npmrc:ro-try",                       # npm config
-  "~/.cache/uv:rw-try",                    # uv
-]
-
-# ============================================================
-# [seccomp] 系统调用过滤配置集
+# ==============================================================================
+# 系统调用安全过滤配置集: [seccomp]
 #
-#   default = """..."""    seccomp=true 时使用的默认配置 (必填)
-#   其他任意键 = """..."""  自定义配置, 例如 filterA
-#
-# 预设/--override 选择方式:
-#   seccomp = true          使用 default
-#   seccomp = false         关闭
-#   seccomp = "filterA"     使用自定义配置
-#
-# 运行时会据此生成 C 源码、即时编译, 导出 BPF 后通过
-# --add-seccomp-fd 传给 bwrap (参考 flatpak common/flatpak-run.c)。
-# 首次编译后缓存到 <state_dir>/.seccomp-cache/,
-# 文件名为 seccomp-<blake2b(文本)>.{c,gen,bpf};
-# 文本变化时哈希不同, 自动重新生成; 缓存不自动清理。
-#
-# 行语法 (每行一个动作, 系统调用可列多个):
-#   default allow|deny|errno <CODE>|kill|log   # 默认动作, 至多一次
-#   allow  <syscall...>                        # 放行
-#   deny   <syscall...>                        # 返回 EPERM
-#   errno <CODE> <syscall...>                  # 返回指定 errno
-#   kill   <syscall...>                        # 直接杀死进程
-#   log    <syscall...>                        # 记录日志后按默认动作
-#   tiocsti                                    # 拦截 ioctl(TIOCSTI) 终端注入
-# ============================================================
+# 引擎会在沙箱启动时依据规则 DSL 即时编译为 BPF 字节码，并按哈希缓存。
+# 规则 DSL 语法:
+#   default allow|deny|errno <CODE>|kill|log   (设置默认过滤动作)
+#   allow|deny|kill|log <syscall...>           (指定系统调用列表执行该动作)
+#   errno <CODE> <syscall...>                  (返回指定错误码，如 EPERM, ENOSYS)
+#   tiocsti                                    (拦截 ioctl(TIOCSTI) 终端伪造注入)
+#   compat32                                   (放行 32 位 x86 系统调用架构)
+# ==============================================================================
 [seccomp]
+# 默认加固规则: 封禁内核提权、命名空间逃逸、内核模块与密钥篡改等敏感系统调用
 default = """
-# 默认放行, 只禁用高危/逃逸类调用
 default allow
-# 终端注入
 tiocsti
-# 挂载/根目录逃逸
 deny mount umount2 pivot_root chroot
-# 文件句柄绕过 mount 隔离
 deny open_by_handle_at name_to_handle_at
-# 禁止沙盒内再次嵌套 namespace
 deny unshare setns
-# 内核模块与重启
 deny init_module finit_module delete_module
 deny reboot swapon swapoff kexec_load kexec_file_load
-# eBPF / perf / userfaultfd / 内核日志
 deny bpf perf_event_open userfaultfd syslog
-# 进程注入与密钥环
 deny ptrace process_vm_readv process_vm_writev
 deny keyctl add_key request_key
 """
 
+# 浏览器/Electron 规则: 允许内部沙箱创建 user namespace (放行 unshare)
 browser = """
 default allow
 tiocsti
@@ -228,11 +256,12 @@ deny ptrace process_vm_readv process_vm_writev
 deny keyctl add_key request_key
 """
 
-harness = """
+# 游戏兼容规则: 允许 32 位系统调用 (compat32)
+gaming = """
 default allow
 tiocsti
-#deny mount umount2 pivot_root
-#deny setns
+compat32
+deny mount umount2 pivot_root
 deny open_by_handle_at name_to_handle_at
 deny init_module finit_module delete_module
 deny reboot swapon swapoff kexec_load kexec_file_load
@@ -240,3 +269,4 @@ deny bpf perf_event_open userfaultfd syslog
 deny ptrace process_vm_readv process_vm_writev
 deny keyctl add_key request_key
 """
+

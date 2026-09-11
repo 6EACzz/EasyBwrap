@@ -1,0 +1,7 @@
+# Git ignore for EasyBwrap
+KNOWN_ISSUES.md
+UserConfig.toml
+__pycache__/
+*.py[cod]
+*$py.class
+
