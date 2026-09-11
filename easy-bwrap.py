@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -616,13 +617,17 @@ def split_list_value(value: object, where: str) -> list[str]:
 
 
 def expand_env_value(val: str) -> str:
-    """展开环境变量值中的波浪号 (~)。支持单个路径或冒号分隔的 PATH 式多路径。"""
-    if "~" not in val:
-        return val
-    if ":" in val:
-        parts = val.split(":")
+    """展开环境变量值中的宿主环境变量 ($VAR 或 ${VAR}) 与波浪号 (~)。
+    
+    支持单个路径或冒号分隔的 PATH 式多路径。
+    """
+    expanded = os.path.expandvars(val)
+    if "~" not in expanded:
+        return expanded
+    if ":" in expanded:
+        parts = expanded.split(":")
         return ":".join(os.path.expanduser(p) if p.startswith("~") else p for p in parts)
-    return os.path.expanduser(val) if val.startswith("~") else val
+    return os.path.expanduser(expanded) if expanded.startswith("~") else expanded
 
 
 def parse_setenv(value: object, where: str) -> list[tuple[str, str]]:
@@ -1135,7 +1140,7 @@ def compute_effective(config: Config) -> dict[str, EffectivePreset]:
         if raw.binds is not None:
             eff.binds = list(raw.binds)
 
-        program = os.path.expanduser(eff.program) if eff.program else ""
+        program = os.path.expandvars(os.path.expanduser(eff.program)) if eff.program else ""
         if not program:
             abort(f"{raw.section} 未配置 program, 且 extends 链也未提供 program")
         if not os.path.isabs(program):
@@ -1276,7 +1281,7 @@ def resolve_preset_name(name: str, config: Config) -> str | None:
 
 
 def resolve_custom_executable(text: str, where: str = "自定义程序") -> str:
-    expanded = os.path.expanduser(text)
+    expanded = os.path.expandvars(os.path.expanduser(text))
     if os.path.isabs(expanded) or "/" in expanded:
         candidate = os.path.abspath(expanded)
     else:
@@ -1792,8 +1797,8 @@ def build_bwrap_cmd(
     # 预设绑定: src[:dst][:mode] 或 { src=..., dst=..., mode=... }
     # 静态绑定先于 pwd 动态绑定, 避免后者遮蔽前者。
     for bind in eff.binds:
-        src = os.path.expanduser(bind.src)
-        dst = os.path.expanduser(bind.dst) if bind.dst else src
+        src = os.path.expandvars(os.path.expanduser(bind.src))
+        dst = os.path.expandvars(os.path.expanduser(bind.dst)) if bind.dst else src
         mode = bind.mode
         if mode == "rw":
             add("--bind", src, dst)
@@ -1843,6 +1848,7 @@ def build_bwrap_cmd(
     if feat("vtty"):
         add("--new-session")
     add("--die-with-parent")
+    add("--")
 
     if feat("x11"):
         add(
@@ -1958,6 +1964,21 @@ def should_use_systemd(mode: str, print_mode: bool = False) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=1)
+def systemd_supports_expand_environment(sr_bin: str = "systemd-run") -> bool:
+    try:
+        res = subprocess.run(
+            [sr_bin, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.0,
+        )
+        return "--expand-environment" in res.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+
+
 def build_systemd_run_args(
     eff: EffectivePreset,
     unit_name: str,
@@ -1972,9 +1993,13 @@ def build_systemd_run_args(
         "-q",
         "--collect",
         "--same-dir",
+    ]
+    if systemd_supports_expand_environment(sr_bin):
+        args.append("--expand-environment=no")
+    args.extend([
         f"--unit={unit_name}",
         f"--description={desc}",
-    ]
+    ])
     slice_name = eff.slice or "app.slice"
     if not slice_name.endswith(".slice"):
         slice_name = f"{slice_name}.slice"
@@ -3312,9 +3337,15 @@ def dispatch(opts: CliOptions, config: Config, conf_path: Path) -> int:
         resolve_xwayland_satellite(print_mode=opts.print_mode)
 
     if not os.path.exists(entry):
-        abort(f"入口不存在: {entry}")
-    if not os.access(entry, os.X_OK):
-        abort(f"入口不可执行: {entry}")
+        if opts.print_mode:
+            warn(f"入口文件在宿主上不存在 (仅预览模式): {entry}")
+        else:
+            abort(f"入口不存在: {entry}")
+    elif not os.access(entry, os.X_OK):
+        if opts.print_mode:
+            warn(f"入口文件在宿主上不可执行 (仅预览模式): {entry}")
+        else:
+            abort(f"入口不可执行: {entry}")
 
     try:
         project_dir = os.path.realpath(os.getcwd())
