@@ -229,7 +229,7 @@ seccomp: 配置文件中的 [seccomp] 提供系统调用过滤规则; default �
 启用时依据规则即时编译并缓存 BPF 字节码, 通过 --add-seccomp-fd 传给 bwrap。
 
 示例:
-  easy-bwrap --print splayer file.mp4
+  easy-bwrap --print mpv file.mp4
   easy-bwrap --override pwd=on --override dbus=off opencode
   easy-bwrap --as zsh opencode --some-flag
   easy-bwrap --as zsh --override net=off /opt/bin/custom --arg
